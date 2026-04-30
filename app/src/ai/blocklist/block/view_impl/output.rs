@@ -119,6 +119,7 @@ use super::common::{
     STATUS_FOOTER_VERTICAL_PADDING, STATUS_ICON_SIZE_DELTA,
 };
 use super::imported_comments::render_imported_comments;
+use super::orchestrate;
 use super::orchestration;
 use super::todos::render_todos;
 use super::CONTENT_HORIZONTAL_PADDING;
@@ -743,6 +744,24 @@ pub(super) fn render(props: Props, app: &AppContext) -> Box<dyn Element> {
                                 &output_message.id,
                                 app,
                             ));
+                        }
+                        AIAgentOutputMessageType::Action(AIAgentAction {
+                            action: AIAgentActionType::Orchestrate(req),
+                            id,
+                            ..
+                        }) if FeatureFlag::OrchestrateTool.is_enabled() => {
+                            // Stage 1 orchestrate confirmation card. Renders
+                            // directly from `Message.ToolCall.Orchestrate`
+                            // (no parallel ClientAction). The full Figma
+                            // layout (model / harness / env / host pickers,
+                            // Reject/Edit/Accept buttons) is structural-stub
+                            // today — see view_impl::orchestrate file-level
+                            // TODO. Five terminal states + streaming
+                            // placeholder are wired.
+                            should_render_footer = false;
+                            should_render_suggestions = false;
+                            output_items
+                                .add_child(orchestrate::render_orchestrate(props, id, req, app));
                         }
                         AIAgentOutputMessageType::Action(AIAgentAction {
                             action:

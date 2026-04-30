@@ -11,8 +11,9 @@ use crate::ai::agent::todos::AIAgentTodoList;
 use crate::ai::agent::{
     util::parse_markdown_into_text_and_code_sections, AIAgentAction, AIAgentActionType,
     AIAgentCitation, AIAgentInput, AIAgentOutputMessage, AIAgentText, AIAgentTodo,
-    ArtifactCreatedData, MessageId, StartAgentExecutionMode, SuggestedAgentModeWorkflow,
-    SuggestedRule, Suggestions, TodoOperation,
+    ArtifactCreatedData, MessageId, OrchestrateAgentRunConfig, OrchestrateExecutionMode,
+    OrchestrateRequest, StartAgentExecutionMode, SuggestedAgentModeWorkflow, SuggestedRule,
+    Suggestions, TodoOperation,
 };
 use crate::ai::agent::{
     CloneRepositoryURL, SubagentCall, SubagentType, SummarizationType, WebFetchStatus,
@@ -92,6 +93,52 @@ fn convert_start_agent_execution_mode(
             StartAgentExecutionMode::local_with_defaults()
         }
     }
+}
+
+fn convert_orchestrate_execution_mode(
+    execution_mode: Option<api::orchestrate::ExecutionMode>,
+) -> OrchestrateExecutionMode {
+    match execution_mode {
+        Some(api::orchestrate::ExecutionMode::Remote(remote)) => OrchestrateExecutionMode::Remote {
+            environment_id: remote.environment_id,
+            worker_host: remote.worker_host,
+            computer_use_enabled: remote.computer_use_enabled,
+        },
+        Some(api::orchestrate::ExecutionMode::Local(_)) | None => OrchestrateExecutionMode::Local,
+    }
+}
+
+fn convert_orchestrate(orchestrate: api::Orchestrate) -> AIAgentActionType {
+    let api::Orchestrate {
+        summary,
+        base_prompt,
+        skills,
+        model_id,
+        harness,
+        agent_run_configs,
+        auto_launch,
+        execution_mode,
+    } = orchestrate;
+    AIAgentActionType::Orchestrate(OrchestrateRequest {
+        summary,
+        base_prompt,
+        skills: skills
+            .into_iter()
+            .filter_map(convert_skill_reference)
+            .collect(),
+        model_id,
+        harness_type: convert_start_agent_v2_harness_type(harness).unwrap_or_default(),
+        execution_mode: convert_orchestrate_execution_mode(execution_mode),
+        agent_run_configs: agent_run_configs
+            .into_iter()
+            .map(|config| OrchestrateAgentRunConfig {
+                name: config.name,
+                prompt: config.prompt,
+                title: config.title,
+            })
+            .collect(),
+        auto_launch,
+    })
 }
 
 fn convert_start_agent_v2_execution_mode(
@@ -569,7 +616,11 @@ impl ConvertAPIMessageToClientOutputMessage for api::Message {
             | api::message::Message::CodeReview(_)
             | api::message::Message::ServerEvent(_)
             | api::message::Message::InvokeSkill(_)
-            | api::message::Message::PassiveSuggestionResult(_) => {
+            | api::message::Message::PassiveSuggestionResult(_)
+            // Stage 2 plan-card config snapshot: hydrated separately by the
+            // plan card's `AIDocumentModel` subscription, not via the
+            // exchange/output stream. No client output message representation.
+            | api::message::Message::OrchestrationConfigSnapshot(_) => {
                 Ok(MaybeAIAgentOutputMessage::NoClientRepresentation)
             }
         }
@@ -759,6 +810,9 @@ impl ConvertAPIToolCallToAIAgentAction for api::message::ToolCall {
                         },
                     ),
                 })
+            }
+            api::message::tool_call::Tool::Orchestrate(orchestrate) => {
+                create_standard_action(convert_orchestrate(orchestrate))
             }
             api::message::tool_call::Tool::SendMessageToAgent(send_message) => {
                 create_standard_action(AIAgentActionType::SendMessageToAgent {

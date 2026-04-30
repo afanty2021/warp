@@ -514,6 +514,10 @@ impl BlocklistAIActionExecutor {
             AIAgentActionType::AskUserQuestion { .. } => self
                 .ask_user_question_executor
                 .update(ctx, |executor, ctx| executor.preprocess_action(input, ctx)),
+            // Orchestrate per-agent dispatch is handled inline by the
+            // confirmation card's Accept handler (see `view_impl::orchestrate`),
+            // not by an executor; nothing to preprocess.
+            AIAgentActionType::Orchestrate(_) => futures::future::ready(()).boxed(),
         }
     }
 
@@ -699,6 +703,15 @@ impl BlocklistAIActionExecutor {
                 .ask_user_question_executor
                 .update(ctx, |executor, ctx| executor.execute(input, ctx))
                 .into(),
+            // Orchestrate is dispatched from the confirmation card on Accept.
+            // No executor flow runs through here; treat as Cancelled if it
+            // somehow reaches the executor (defensive).
+            AIAgentActionType::Orchestrate(_) => {
+                ActionExecution::<()>::Sync(AIAgentActionResultType::Orchestrate(
+                    ai::agent::action_result::OrchestrateResult::Cancelled,
+                ))
+                .into()
+            }
         };
 
         let action_id = action_clone.id.clone();
@@ -899,6 +912,8 @@ impl BlocklistAIActionExecutor {
             AIAgentActionType::AskUserQuestion { .. } => self
                 .ask_user_question_executor
                 .update(ctx, |executor, ctx| executor.should_autoexecute(input, ctx)),
+            // Orchestrate goes through the confirmation card; never auto-executed.
+            AIAgentActionType::Orchestrate(_) => false,
         }
     }
 

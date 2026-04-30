@@ -509,7 +509,11 @@ impl ConvertToExchanges for &api::Task {
                 | api::message::Message::DebugOutput(_)
                 | api::message::Message::ArtifactEvent(_)
                 | api::message::Message::MessagesReceivedFromAgents(_)
-                | api::message::Message::ModelUsed(_) => false,
+                | api::message::Message::ModelUsed(_)
+                // [Stage 2] Plan-card config snapshot — hydrated by the plan
+                // card's AIDocumentModel subscription, not part of the
+                // exchange's input/output stream.
+                | api::message::Message::OrchestrationConfigSnapshot(_) => false,
             };
 
             if !added_message_as_exchange_input {
@@ -1540,6 +1544,80 @@ pub(crate) fn convert_tool_call_result_to_input(
                 context,
             })
         }
+        Some(ToolCallResultType::OrchestrateResult(result)) => {
+            use ai::agent::action_result::{
+                OrchestrateAgentOutcome, OrchestrateAgentOutcomeKind,
+                OrchestrateLaunchedExecutionMode, OrchestrateResult,
+            };
+            let orchestrate_result = match &result.outcome {
+                Some(api::orchestrate_result::Outcome::Launched(launched)) => {
+                    let execution_mode = match &launched.execution_mode {
+                        Some(api::orchestrate_result::launched::ExecutionMode::Remote(remote)) => {
+                            OrchestrateLaunchedExecutionMode::Remote {
+                                environment_id: remote.environment_id.clone(),
+                                worker_host: remote.worker_host.clone(),
+                                computer_use_enabled: remote.computer_use_enabled,
+                            }
+                        }
+                        Some(api::orchestrate_result::launched::ExecutionMode::Local(_)) | None => {
+                            OrchestrateLaunchedExecutionMode::Local
+                        }
+                    };
+                    let agents = launched
+                        .agents
+                        .iter()
+                        .map(|outcome| OrchestrateAgentOutcome {
+                            name: outcome.name.clone(),
+                            title: outcome.title.clone(),
+                            kind: match &outcome.result {
+                                Some(api::orchestrate_result::agent_outcome::Result::Launched(
+                                    launched_agent,
+                                )) => OrchestrateAgentOutcomeKind::Launched {
+                                    agent_id: launched_agent.agent_id.clone(),
+                                },
+                                Some(api::orchestrate_result::agent_outcome::Result::Failed(
+                                    failed,
+                                )) => OrchestrateAgentOutcomeKind::Failed {
+                                    error: failed.error.clone(),
+                                },
+                                None => OrchestrateAgentOutcomeKind::Failed {
+                                    error: String::new(),
+                                },
+                            },
+                        })
+                        .collect();
+                    OrchestrateResult::Launched {
+                        model_id: launched.model_id.clone(),
+                        harness_type: launched
+                            .harness
+                            .as_ref()
+                            .map(|h| h.r#type.clone())
+                            .unwrap_or_default(),
+                        execution_mode,
+                        agents,
+                    }
+                }
+                Some(api::orchestrate_result::Outcome::LaunchDenied(denied)) => {
+                    OrchestrateResult::LaunchDenied {
+                        reason: denied.reason.clone(),
+                    }
+                }
+                Some(api::orchestrate_result::Outcome::Failure(failure)) => {
+                    OrchestrateResult::Failure {
+                        error: failure.error.clone(),
+                    }
+                }
+                None => OrchestrateResult::Cancelled,
+            };
+            Some(AIAgentInput::ActionResult {
+                result: AIAgentActionResult {
+                    id: tool_call_id.into(),
+                    task_id: task_id.clone(),
+                    result: AIAgentActionResultType::Orchestrate(orchestrate_result),
+                },
+                context,
+            })
+        }
         // Deprecated/unused result types or absent result.
         Some(ToolCallResultType::SuggestCreatePlan(..))
         | Some(ToolCallResultType::SuggestPlan(..))
@@ -1674,6 +1752,9 @@ fn create_cancelled_result_for_tool_call(
         ToolType::SendMessageToAgent(_) => {
             AIAgentActionResultType::SendMessageToAgent(SendMessageToAgentResult::Cancelled)
         }
+        ToolType::Orchestrate(_) => AIAgentActionResultType::Orchestrate(
+            ai::agent::action_result::OrchestrateResult::Cancelled,
+        ),
         // These tools are deprecated.
         ToolType::SuggestCreatePlan(_) | ToolType::SuggestPlan(_) => return None,
     };
@@ -1875,7 +1956,11 @@ where
                 | api::message::Message::DebugOutput(_)
                 | api::message::Message::ArtifactEvent(_)
                 | api::message::Message::InvokeSkill(_)
-                | api::message::Message::ModelUsed(_) => {
+                | api::message::Message::ModelUsed(_)
+                // [Stage 2] Plan-card config snapshot is server-synthesized
+                // metadata; treat it like other agent/stream activity for
+                // first-token timing purposes.
+                | api::message::Message::OrchestrationConfigSnapshot(_) => {
                     message.timestamp.as_ref().map(|timestamp| {
                         proto_timestamp_to_local_datetime(timestamp.seconds, timestamp.nanos)
                     })

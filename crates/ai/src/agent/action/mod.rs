@@ -13,10 +13,11 @@ use crate::{
         action_result::{
             AIAgentActionResultType, AskUserQuestionResult, CallMCPToolResult,
             CreateDocumentsResult, EditDocumentsResult, FetchConversationResult, FileGlobResult,
-            FileGlobV2Result, GrepResult, InsertReviewCommentsResult, ReadDocumentsResult,
-            ReadFilesResult, ReadMCPResourceResult, ReadShellCommandOutputResult, ReadSkillResult,
-            RequestCommandOutputResult, RequestComputerUseResult, RequestFileEditsResult,
-            SearchCodebaseResult, SendMessageToAgentResult, StartAgentResult, StartAgentVersion,
+            FileGlobV2Result, GrepResult, InsertReviewCommentsResult, OrchestrateResult,
+            ReadDocumentsResult, ReadFilesResult, ReadMCPResourceResult,
+            ReadShellCommandOutputResult, ReadSkillResult, RequestCommandOutputResult,
+            RequestComputerUseResult, RequestFileEditsResult, SearchCodebaseResult,
+            SendMessageToAgentResult, StartAgentResult, StartAgentVersion,
             SuggestNewConversationResult, SuggestPromptResult,
             TransferShellCommandControlToUserResult, UploadArtifactResult, UseComputerResult,
             WriteToLongRunningShellCommandResult,
@@ -167,6 +168,59 @@ pub enum AIAgentActionType {
     AskUserQuestion {
         questions: Vec<AskUserQuestionItem>,
     },
+
+    /// AI requested batched orchestration of one-or-more child agents that
+    /// share run-wide configuration (model, harness, execution mode).
+    /// The full per-child prompt is computed at dispatch time as
+    /// `base_prompt + "\n\n" + agent_run_configs[i].prompt` (or just
+    /// `base_prompt` when the per-agent `prompt` is empty).
+    Orchestrate(OrchestrateRequest),
+}
+
+/// Run-wide + per-agent configuration for an `Orchestrate` tool call.
+///
+/// Mirrors the proto `Orchestrate` message. Server-resolved fields
+/// (`model_id`, `harness_type`, `execution_mode`'s remote details,
+/// `auto_launch`) are folded in by the server's final
+/// `SetOrchestrateToolCall` re-emission once the tool call payload is
+/// complete; the client renders the full layout from a fully-resolved
+/// instance only.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct OrchestrateRequest {
+    pub summary: String,
+    pub base_prompt: String,
+    pub skills: Vec<SkillReference>,
+    pub model_id: String,
+    pub harness_type: String,
+    pub execution_mode: OrchestrateExecutionMode,
+    pub agent_run_configs: Vec<OrchestrateAgentRunConfig>,
+    /// Stage 2: when `true`, the client skips the confirmation card and
+    /// dispatches per-agent `CreateAgentTask` immediately. Stage 1 always
+    /// receives `false`.
+    pub auto_launch: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum OrchestrateExecutionMode {
+    Local,
+    Remote {
+        environment_id: String,
+        worker_host: String,
+        computer_use_enabled: bool,
+    },
+}
+
+impl OrchestrateExecutionMode {
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Self::Remote { .. })
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct OrchestrateAgentRunConfig {
+    pub name: String,
+    pub prompt: String,
+    pub title: String,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -317,6 +371,9 @@ impl AIAgentActionType {
             Self::AskUserQuestion { .. } => {
                 AIAgentActionResultType::AskUserQuestion(AskUserQuestionResult::Cancelled)
             }
+            Self::Orchestrate(_) => {
+                AIAgentActionResultType::Orchestrate(OrchestrateResult::Cancelled)
+            }
         }
     }
 
@@ -361,6 +418,9 @@ impl AIAgentActionType {
             }
             Self::AskUserQuestion { questions } => {
                 format!("Ask user {} question(s)", questions.len())
+            }
+            Self::Orchestrate(req) => {
+                format!("Orchestrate {} agent(s)", req.agent_run_configs.len())
             }
         }
     }
@@ -533,6 +593,15 @@ impl Display for AIAgentActionType {
             }
             AIAgentActionType::AskUserQuestion { questions } => {
                 write!(f, "AskUserQuestion: {} question(s)", questions.len())
+            }
+            AIAgentActionType::Orchestrate(req) => {
+                let names = req
+                    .agent_run_configs
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "Orchestrate: summary='{}' agents=[{names}]", req.summary,)
             }
         }
     }

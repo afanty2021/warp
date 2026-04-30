@@ -105,6 +105,7 @@ pub async fn generate_multi_agent_output(
             supports_bundled_skills: FeatureFlag::BundledSkills.is_enabled(),
             supports_research_agent: params.research_agent_enabled,
             supports_orchestration_v2: FeatureFlag::OrchestrationV2.is_enabled(),
+            supports_orchestrate: FeatureFlag::OrchestrateTool.is_enabled(),
         }),
         metadata: Some(api::request::Metadata {
             logging: logging_metadata,
@@ -213,11 +214,23 @@ fn get_supported_tools(params: &RequestParams) -> Vec<api::ToolType> {
     }
 
     if params.orchestration_enabled {
-        supported_tools.push(if FeatureFlag::OrchestrationV2.is_enabled() {
-            api::ToolType::StartAgentV2
-        } else {
-            api::ToolType::StartAgent
-        });
+        // The orchestrate tool replaces start_agent / start_agent_v2 entirely
+        // when both the client-side flag and orchestration v2 are on. The
+        // server's `selectStartAgentTool` hard-switch picks orchestrate over
+        // the legacy start_agent tools whenever they're all advertised, so
+        // there's no per-call coexistence to worry about. We still advertise
+        // SendMessageToAgent alongside.
+        supported_tools.push(
+            if FeatureFlag::OrchestrateTool.is_enabled()
+                && FeatureFlag::OrchestrationV2.is_enabled()
+            {
+                api::ToolType::Orchestrate
+            } else if FeatureFlag::OrchestrationV2.is_enabled() {
+                api::ToolType::StartAgentV2
+            } else {
+                api::ToolType::StartAgent
+            },
+        );
         supported_tools.push(api::ToolType::SendMessageToAgent);
     }
 

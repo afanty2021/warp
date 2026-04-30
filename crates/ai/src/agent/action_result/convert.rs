@@ -1287,6 +1287,101 @@ impl From<AskUserQuestionResult> for api::request::input::tool_call_result::Resu
     }
 }
 
+impl From<OrchestrateLaunchedExecutionMode> for api::orchestrate_result::launched::ExecutionMode {
+    fn from(mode: OrchestrateLaunchedExecutionMode) -> Self {
+        match mode {
+            OrchestrateLaunchedExecutionMode::Local => {
+                api::orchestrate_result::launched::ExecutionMode::Local(api::orchestrate::Local {})
+            }
+            OrchestrateLaunchedExecutionMode::Remote {
+                environment_id,
+                worker_host,
+                computer_use_enabled,
+            } => {
+                api::orchestrate_result::launched::ExecutionMode::Remote(api::orchestrate::Remote {
+                    environment_id,
+                    worker_host,
+                    computer_use_enabled,
+                })
+            }
+        }
+    }
+}
+
+impl From<OrchestrateAgentOutcome> for api::orchestrate_result::AgentOutcome {
+    fn from(outcome: OrchestrateAgentOutcome) -> Self {
+        let result = match outcome.kind {
+            OrchestrateAgentOutcomeKind::Launched { agent_id } => {
+                api::orchestrate_result::agent_outcome::Result::Launched(
+                    api::orchestrate_result::LaunchedAgent { agent_id },
+                )
+            }
+            OrchestrateAgentOutcomeKind::Failed { error } => {
+                api::orchestrate_result::agent_outcome::Result::Failed(
+                    api::orchestrate_result::FailedAgent { error },
+                )
+            }
+        };
+        api::orchestrate_result::AgentOutcome {
+            name: outcome.name,
+            title: outcome.title,
+            result: Some(result),
+        }
+    }
+}
+
+impl TryFrom<OrchestrateResult> for api::request::input::tool_call_result::Result {
+    type Error = ConvertToAPITypeError;
+
+    fn try_from(result: OrchestrateResult) -> Result<Self, Self::Error> {
+        match result {
+            OrchestrateResult::Launched {
+                model_id,
+                harness_type,
+                execution_mode,
+                agents,
+            } => Ok(
+                api::request::input::tool_call_result::Result::OrchestrateResult(
+                    api::OrchestrateResult {
+                        outcome: Some(api::orchestrate_result::Outcome::Launched(
+                            api::orchestrate_result::Launched {
+                                model_id,
+                                harness: Some(api::start_agent_v2::execution_mode::Harness {
+                                    r#type: harness_type,
+                                }),
+                                execution_mode: Some(execution_mode.into()),
+                                agents: agents.into_iter().map(Into::into).collect(),
+                            },
+                        )),
+                    },
+                ),
+            ),
+            OrchestrateResult::LaunchDenied { reason } => Ok(
+                api::request::input::tool_call_result::Result::OrchestrateResult(
+                    api::OrchestrateResult {
+                        outcome: Some(api::orchestrate_result::Outcome::LaunchDenied(
+                            api::orchestrate_result::LaunchDenied { reason },
+                        )),
+                    },
+                ),
+            ),
+            OrchestrateResult::Failure { error } => Ok(
+                api::request::input::tool_call_result::Result::OrchestrateResult(
+                    api::OrchestrateResult {
+                        outcome: Some(api::orchestrate_result::Outcome::Failure(
+                            api::orchestrate_result::Failure { error },
+                        )),
+                    },
+                ),
+            ),
+            // Reject is conveyed by the generic ToolCallResult.Cancel marker
+            // synthesized server-side on the next user input; nothing for the
+            // client to send on the wire here.
+            OrchestrateResult::Cancelled => Err(ConvertToAPITypeError::Ignore),
+        }
+    }
+}
+
 impl TryFrom<InsertReviewCommentsResult> for api::request::input::tool_call_result::Result {
     type Error = ConvertToAPITypeError;
 

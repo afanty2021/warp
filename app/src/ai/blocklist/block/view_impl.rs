@@ -24,6 +24,7 @@ mod comments;
 mod header;
 mod imported_comments;
 mod input;
+mod orchestrate;
 mod orchestration;
 pub mod output;
 pub mod query;

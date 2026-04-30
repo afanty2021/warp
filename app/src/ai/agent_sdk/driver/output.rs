@@ -303,6 +303,8 @@ pub mod text {
                 // SendMessageToAgent is a client-side orchestration action, not used in SDK
                 AIAgentActionResultType::SendMessageToAgent(_) => Ok(()),
                 AIAgentActionResultType::AskUserQuestion(_) => Ok(()),
+                // Orchestrate is a desktop-client-only action; not used in the SDK.
+                AIAgentActionResultType::Orchestrate(_) => Ok(()),
             },
         }
     }
@@ -427,6 +429,8 @@ pub mod text {
                         )?;
                     }
                     AIAgentActionType::AskUserQuestion { .. } => (),
+                    // Orchestrate is desktop-client-only; SDK driver renders nothing.
+                    AIAgentActionType::Orchestrate(_) => (),
                 },
                 AIAgentOutputMessageType::TodoOperation(operation) => match operation {
                     TodoOperation::UpdateTodos { todos } => {
@@ -1108,6 +1112,9 @@ pub mod json {
                     | AIAgentActionType::SendMessageToAgent { .. }
                     | AIAgentActionType::TransferShellCommandControlToUser { .. } => None,
                     AIAgentActionType::AskUserQuestion { .. } => None,
+                    // Orchestrate is desktop-client-only; SDK has no JSON
+                    // representation for it.
+                    AIAgentActionType::Orchestrate(_) => None,
                 },
                 AIAgentOutputMessageType::TodoOperation(operation) => match operation {
                     TodoOperation::UpdateTodos { todos } => Some(JsonMessage::UpdateTodos {
