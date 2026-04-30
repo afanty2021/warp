@@ -193,6 +193,10 @@ pub(crate) struct Props<'a> {
     pub(super) aws_bedrock_credentials_error_view:
         Option<&'a ViewHandle<AwsBedrockCredentialsErrorView>>,
     pub(super) imported_comments: &'a HashMap<AIAgentActionId, ImportedCommentGroup>,
+    pub(super) orchestrate_edit_states:
+        &'a HashMap<AIAgentActionId, super::super::OrchestrateEditState>,
+    pub(super) orchestrate_card_handles:
+        &'a HashMap<AIAgentActionId, super::super::OrchestrateCardHandles>,
     #[cfg(feature = "local_fs")]
     pub(crate) resolved_code_block_paths:
         &'a HashMap<std::path::PathBuf, Option<std::path::PathBuf>>,

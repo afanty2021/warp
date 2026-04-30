@@ -1095,6 +1095,8 @@ impl View for AIBlock {
                     .aws_bedrock_credentials_error_view
                     .as_ref(),
                 imported_comments: &self.imported_comments,
+                orchestrate_edit_states: &self.orchestrate_edit_states,
+                orchestrate_card_handles: &self.orchestrate_card_handles,
                 #[cfg(feature = "local_fs")]
                 resolved_code_block_paths: &self.resolved_code_block_paths,
                 #[cfg(feature = "local_fs")]

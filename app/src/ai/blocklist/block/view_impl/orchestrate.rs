@@ -1,52 +1,38 @@
 //! Renders the inline confirmation card for an `orchestrate` tool call.
 //!
 //! Modeled on the `orchestration.rs` sibling that renders `start_agent_v2`.
-//! The full Figma-fidelity card (model / harness / environment / host
-//! pickers, inline editor open/close with retained values, Cloud-without-env
-//! validation gating, OpenCode + Cloud Accept-disabling, OpenCode-reset on
-//! Local→Cloud toggle) is laid out here as **structure first**: the card
-//! renders all five required post-action states (Launching N, Started N,
-//! Started M of N, Failed to start orchestration, Cancelled) plus a streaming
-//! placeholder, and the pre-dispatch Reject/Edit/Accept buttons are stubbed
-//! visually with TODO seams pointing at where the dispatch helper
-//! ([`crate::ai::blocklist::orchestrate_dispatch::dispatch_orchestrate`])
-//! plugs in.
-//!
-//! Stage 2 seam: when `req.auto_launch` is true the card skips the
-//! confirmation phase and transitions directly into Launching N. The
-//! interactive Reject/Edit/Accept layout is suppressed in that branch.
+//! Stage 1 covers the user-facing card states + interactive
+//! Reject / Edit / Accept buttons, the inline editor (Local/Cloud toggle,
+//! model/harness/environment cycle pickers, worker_host text-only with
+//! TODO), and the Cloud-without-env / OpenCode+Cloud Accept-disabled
+//! validation gating.
 //!
 //! Spec references: TECH.md §8 ("Client: confirmation card"), §9
 //! ("Per-agent task creation"), PRODUCT.md "Confirmation card" + "Post-action
-//! card states".
+//! card states" + "Invariants".
 //
-// TODO(QUALITY-569): the live pre-dispatch UI (Reject/Edit/Accept buttons,
-// inline editor with retained values across mode toggles, the OpenCode +
-// Cloud Accept-disabled gate, the Cloud-without-env Accept-disabled gate)
-// is structural-stub today. Wiring it requires:
-//   1. State handles in `AIBlockStateHandles` for the three buttons + the
-//      Edit-open-vs-closed flag + the per-field edited values.
-//   2. Re-using `ModelPicker` (in `app/src/settings_view/ai_page.rs`),
-//      environment + worker_host + harness pickers (paths TBD; expected
-//      under `app/src/ai/execution_profiles/`).
-//   3. A new `AIBlockAction::OrchestrateAccept{ /* edited fields */ }`
-//      variant routed into `BlocklistAIController` so the dispatch helper
-//      can be `await`-ed off the main loop.
-// The card layout below sketches the surface so the dispatcher arm and the
-// data path can land in this PR; the picker integration is best done as a
-// fast-follow once the proto / dispatch / data-model infrastructure is in
-// place.
+// TODO(QUALITY-569 fast-follow): the model/harness/environment cycle
+// buttons are functional placeholders for the full `Dropdown<A>` /
+// `FilterableDropdown<A>` integration. The interaction surface (action
+// dispatch, validation gating, edit state retention across mode toggles)
+// is identical; the Stage 2 fast-follow swaps the cycle buttons for real
+// dropdowns to give the user direct access to the full model/harness/env
+// picker UX matching `agent_management/view.rs`.
 
 use ai::agent::action::{OrchestrateExecutionMode, OrchestrateRequest};
 use ai::agent::action_result::{OrchestrateAgentOutcomeKind, OrchestrateResult};
+use pathfinder_color::ColorU;
 use warpui::elements::{
-    Container, CornerRadius, CrossAxisAlignment, Empty, Flex, ParentElement, Radius, Text,
+    Container, CornerRadius, CrossAxisAlignment, Empty, Flex, Hoverable, MainAxisAlignment,
+    MainAxisSize, MouseStateHandle, ParentElement, Radius, Text,
 };
+use warpui::platform::Cursor;
 use warpui::{AppContext, Element, SingletonEntity};
 
 use crate::ai::agent::icons;
 use crate::ai::agent::{AIAgentActionId, AIAgentActionResultType};
 use crate::ai::blocklist::action_model::AIActionStatus;
+use crate::ai::blocklist::block::{AIBlockAction, OrchestrateCardHandles, OrchestrateEditState};
 use crate::ai::blocklist::inline_action::inline_action_icons;
 use crate::ai::blocklist::inline_action::requested_action::render_requested_action_row_for_text;
 use crate::appearance::Appearance;
@@ -60,19 +46,6 @@ use super::WithContentItemSpacing;
 /// Dispatched from the tool-call view dispatcher in `output.rs`. The card
 /// is gated on `FeatureFlag::OrchestrateTool` at the dispatcher level; when
 /// the flag is off this function is never reached.
-///
-/// Returns an [`Element`] that renders one of:
-/// - The streaming placeholder (request received but tool call still
-///   incomplete — server hasn't yet emitted its final
-///   `SetOrchestrateToolCall` with run-wide defaults folded in).
-/// - The Launching N agents transient state (Accept clicked, dispatch in
-///   flight).
-/// - The Started N / Started M of N / Failed / Cancelled / Disabled
-///   terminal states (driven by the recorded `AIAgentActionResultType`).
-/// - The full pre-dispatch confirmation layout (title row + summary body +
-///   agent pills + Reject/Edit/Accept buttons). Today this is the
-///   structural stub described in the file-level TODO; the picker
-///   integration lands in a fast-follow.
 pub(super) fn render_orchestrate(
     props: Props,
     action_id: &AIAgentActionId,
@@ -83,20 +56,9 @@ pub(super) fn render_orchestrate(
     let theme = appearance.theme();
     let status = props.action_model.as_ref(app).get_action_status(action_id);
 
-    // Stage 1 invariant: the server defers writing run-wide defaults onto the
-    // tool call message until streaming completes (`IsComplete` flips true).
-    // The client mirrors that by gating its full layout on the recorded
-    // action status — when streaming, render a skeleton rather than a half-
-    // populated card. This avoids re-render churn while the LLM is mid-
-    // stream.
     if props.model.status(app).is_streaming() {
         return render_streaming_placeholder(req, appearance, app);
     }
-
-    // Stage 2 seam: when auto_launch is true the card skips the
-    // confirmation phase and the dispatch helper has already been kicked
-    // off. The recorded result drives the visual state.
-    let _stage2_auto_launch = req.auto_launch;
 
     if let Some(AIActionStatus::Finished(result)) = &status {
         if let AIAgentActionResultType::Orchestrate(orchestrate_result) = &result.result {
@@ -109,13 +71,40 @@ pub(super) fn render_orchestrate(
         return Empty::new().finish();
     }
 
-    // Pre-dispatch confirmation layout. See the file-level TODO for the
-    // picker integration that converts this from a visual stub into the
-    // live interactive card.
+    // Pre-dispatch confirmation layout. Pulls per-action edit state +
+    // button handles from the AIBlock; the LLM-supplied request is the
+    // source of truth until the user clicks Edit.
+    let display_state = props
+        .orchestrate_edit_states
+        .get(action_id)
+        .cloned()
+        .unwrap_or_else(|| OrchestrateEditState::from_request(req));
+    let handles = props
+        .orchestrate_card_handles
+        .get(action_id)
+        .cloned()
+        .unwrap_or_default();
+
     let mut column = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
-    column.add_child(render_summary_title_row(req, appearance));
-    column.add_child(render_body_text(req, appearance));
-    column.add_child(render_agents_footer(req, appearance));
+    column.add_child(render_summary_title_row(
+        action_id,
+        &display_state,
+        &handles,
+        appearance,
+    ));
+    column.add_child(render_body_text(&display_state, appearance));
+    column.add_child(render_agents_footer(&display_state, appearance));
+    if display_state.is_editor_open {
+        column.add_child(render_editor(
+            action_id,
+            &display_state,
+            &handles,
+            appearance,
+        ));
+    }
+    if let Some(reason) = display_state.accept_disabled_reason() {
+        column.add_child(render_validation_error(reason, appearance));
+    }
     Container::new(column.finish())
         .with_horizontal_padding(8.)
         .with_vertical_padding(8.)
@@ -156,10 +145,6 @@ fn render_terminal_state(
             let label = if launched == total {
                 format!("Started {total} agent(s)")
             } else {
-                // PRODUCT.md "Post-action card states": the M=0 case
-                // (every per-agent dispatch failed) is rendered under
-                // "Started M of N agents", not "Failed to start
-                // orchestration".
                 format!("Started {launched} of {total} agent(s)")
             };
             render_status_only_card(
@@ -174,8 +159,6 @@ fn render_terminal_state(
             )
         }
         OrchestrateResult::LaunchDenied { reason } => {
-            // [Stage 2] Disabled-state card. Stage 1 server never emits
-            // this variant; this render path is the forward-compat seam.
             let body = if reason.is_empty() {
                 "Orchestration is currently disabled. Re-enable on the plan card to launch."
                     .to_string()
@@ -206,15 +189,10 @@ fn render_terminal_state(
 
 #[derive(Clone, Copy)]
 enum StatusKind {
-    /// Pre-launch (streaming, dispatch in flight).
     Pending,
-    /// All children launched.
     Success,
-    /// Some children launched, some failed (or M=0).
     Mixed,
-    /// Pre-dispatch failure (couldn't begin the launch sequence).
     Failure,
-    /// User rejected, or Stage 2 disapproval Disabled state.
     Cancelled,
 }
 
@@ -226,10 +204,6 @@ fn render_status_only_card(
 ) -> Box<dyn Element> {
     let theme = appearance.theme();
     let icon = match kind {
-        // Pending and Mixed both reuse the yellow running icon (Mixed = some
-        // failures alongside successes; rendered with the same warning vibe
-        // as a long-running command). Stage 2 fast-follow can swap in a
-        // dedicated mixed-state icon.
         StatusKind::Pending | StatusKind::Mixed => icons::yellow_running_icon(appearance).finish(),
         StatusKind::Success => inline_action_icons::green_check_icon(appearance).finish(),
         StatusKind::Failure => inline_action_icons::red_x_icon(appearance).finish(),
@@ -250,34 +224,81 @@ fn render_status_only_card(
         .finish()
 }
 
-/// Title row for the pre-dispatch confirmation card. Renders the
-/// LLM-supplied `summary` text. The Reject (`C`) / Edit (`⌘E`) / Accept
-/// (`⌥↵`) buttons are the file-level TODO seam.
-fn render_summary_title_row(req: &OrchestrateRequest, appearance: &Appearance) -> Box<dyn Element> {
-    let summary = if req.summary.is_empty() {
-        format!("Orchestrate {} agent(s)", req.agent_run_configs.len())
+fn render_summary_title_row(
+    action_id: &AIAgentActionId,
+    state: &OrchestrateEditState,
+    handles: &OrchestrateCardHandles,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    let summary = if state.summary.is_empty() {
+        format!("Orchestrate {} agent(s)", state.agent_run_configs.len())
     } else {
-        req.summary.clone()
+        state.summary.clone()
     };
-    Container::new(
-        Text::new(
-            summary,
-            appearance.ui_font_family(),
-            appearance.monospace_font_size(),
-        )
-        .finish(),
+    let title = Text::new(
+        summary,
+        appearance.ui_font_family(),
+        appearance.monospace_font_size(),
     )
-    .with_margin_bottom(4.)
-    .finish()
+    .finish();
+
+    let edit_label = if state.is_editor_open {
+        "Done editing"
+    } else {
+        "Edit"
+    };
+    let accept_disabled = state.accept_disabled_reason().is_some();
+
+    let reject_button = render_card_button(
+        "Reject",
+        AIBlockAction::OrchestrateReject {
+            action_id: action_id.clone(),
+        },
+        handles.reject_button.clone(),
+        false,
+        appearance,
+    );
+    let edit_button = render_card_button(
+        edit_label,
+        AIBlockAction::OrchestrateToggleEdit {
+            action_id: action_id.clone(),
+        },
+        handles.edit_button.clone(),
+        false,
+        appearance,
+    );
+    let accept_button = render_card_button(
+        "Accept",
+        AIBlockAction::OrchestrateAccept {
+            action_id: action_id.clone(),
+        },
+        handles.accept_button.clone(),
+        accept_disabled,
+        appearance,
+    );
+
+    let buttons = Flex::row()
+        .with_main_axis_alignment(MainAxisAlignment::End)
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_main_axis_size(MainAxisSize::Min)
+        .with_child(reject_button)
+        .with_child(edit_button)
+        .with_child(accept_button)
+        .finish();
+
+    let row = Flex::row()
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_main_axis_size(MainAxisSize::Max)
+        .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+        .with_child(title)
+        .with_child(buttons)
+        .finish();
+    Container::new(row).with_margin_bottom(4.).finish()
 }
 
-fn render_body_text(req: &OrchestrateRequest, appearance: &Appearance) -> Box<dyn Element> {
-    // The base prompt isn't user-visible per spec ("Skills and base prompt
-    // are passed through verbatim and not displayed."), but we surface
-    // execution-mode + harness summary so the user has at-a-glance context
-    // about the run-wide configuration before launching.
+fn render_body_text(state: &OrchestrateEditState, appearance: &Appearance) -> Box<dyn Element> {
     let theme = appearance.theme();
-    let mode_label = match &req.execution_mode {
+    let mode_label = match &state.execution_mode {
         OrchestrateExecutionMode::Local => "Local".to_string(),
         OrchestrateExecutionMode::Remote { environment_id, .. } => {
             if environment_id.is_empty() {
@@ -287,21 +308,21 @@ fn render_body_text(req: &OrchestrateRequest, appearance: &Appearance) -> Box<dy
             }
         }
     };
-    let harness = if req.harness_type.is_empty() {
+    let harness = if state.harness_type.is_empty() {
         "default harness"
     } else {
-        req.harness_type.as_str()
+        state.harness_type.as_str()
     };
-    let model = if req.model_id.is_empty() {
+    let model = if state.model_id.is_empty() {
         "default model"
     } else {
-        req.model_id.as_str()
+        state.model_id.as_str()
     };
     Container::new(
         Text::new(
             format!(
                 "{} agent(s) · {mode_label} · {harness} · {model}",
-                req.agent_run_configs.len()
+                state.agent_run_configs.len()
             ),
             appearance.ui_font_family(),
             appearance.monospace_font_size(),
@@ -314,25 +335,19 @@ fn render_body_text(req: &OrchestrateRequest, appearance: &Appearance) -> Box<dy
     .finish()
 }
 
-/// Agents footer: `Agents (N)` label + named pills, one per
-/// `agent_run_configs[i].name`. Stub renders one row per agent so the count
-/// + names are visible. The proper Figma pill styling (deterministic color
-/// + initial-letter avatar via `PillSpec`) lands as a fast-follow once
-/// `OrchestrationPillBar` exposes its primitives publicly; today they're
-/// private to `agent_view::orchestration_pill_bar`.
-fn render_agents_footer(req: &OrchestrateRequest, appearance: &Appearance) -> Box<dyn Element> {
+fn render_agents_footer(state: &OrchestrateEditState, appearance: &Appearance) -> Box<dyn Element> {
     let theme = appearance.theme();
     let mut column = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
     column.add_child(
         Text::new(
-            format!("Agents ({})", req.agent_run_configs.len()),
+            format!("Agents ({})", state.agent_run_configs.len()),
             appearance.ui_font_family(),
             appearance.monospace_font_size(),
         )
         .with_color(blended_colors::text_disabled(theme, theme.surface_2()))
         .finish(),
     );
-    for cfg in &req.agent_run_configs {
+    for cfg in &state.agent_run_configs {
         column.add_child(
             Container::new(
                 Text::new(
@@ -347,6 +362,293 @@ fn render_agents_footer(req: &OrchestrateRequest, appearance: &Appearance) -> Bo
         );
     }
     column.finish()
+}
+
+fn render_editor(
+    action_id: &AIAgentActionId,
+    state: &OrchestrateEditState,
+    handles: &OrchestrateCardHandles,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    let theme = appearance.theme();
+    let mut column = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
+
+    column.add_child(render_mode_toggle(action_id, state, handles, appearance));
+    column.add_child(render_picker_row(
+        "Model",
+        state.model_id.clone(),
+        AIBlockAction::OrchestrateModelChanged {
+            action_id: action_id.clone(),
+            model_id: cycle_model(&state.model_id),
+        },
+        handles.model_picker.clone(),
+        appearance,
+    ));
+    column.add_child(render_picker_row(
+        "Harness",
+        state.harness_type.clone(),
+        AIBlockAction::OrchestrateHarnessChanged {
+            action_id: action_id.clone(),
+            harness_type: cycle_harness(&state.harness_type),
+        },
+        handles.harness_picker.clone(),
+        appearance,
+    ));
+    if let OrchestrateExecutionMode::Remote {
+        environment_id,
+        worker_host,
+        ..
+    } = &state.execution_mode
+    {
+        column.add_child(render_picker_row(
+            "Environment",
+            if environment_id.is_empty() {
+                "(none selected)".to_string()
+            } else {
+                environment_id.clone()
+            },
+            AIBlockAction::OrchestrateEnvironmentChanged {
+                action_id: action_id.clone(),
+                environment_id: cycle_environment(environment_id),
+            },
+            handles.environment_picker.clone(),
+            appearance,
+        ));
+        column.add_child(
+            Container::new(
+                Text::new(
+                    format!(
+                        "Worker host: {} (TODO: editable picker)",
+                        if worker_host.is_empty() {
+                            "warp"
+                        } else {
+                            worker_host.as_str()
+                        }
+                    ),
+                    appearance.ui_font_family(),
+                    appearance.monospace_font_size(),
+                )
+                .with_color(blended_colors::text_disabled(theme, theme.surface_2()))
+                .finish(),
+            )
+            .with_margin_top(4.)
+            .finish(),
+        );
+    }
+
+    Container::new(column.finish())
+        .with_horizontal_padding(8.)
+        .with_vertical_padding(8.)
+        .with_margin_top(6.)
+        .with_background_color(theme.surface_1().into())
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+        .finish()
+}
+
+fn render_mode_toggle(
+    action_id: &AIAgentActionId,
+    state: &OrchestrateEditState,
+    handles: &OrchestrateCardHandles,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    let theme = appearance.theme();
+    let is_remote = state.execution_mode.is_remote();
+    let label = Text::new(
+        "Run on:".to_string(),
+        appearance.ui_font_family(),
+        appearance.monospace_font_size(),
+    )
+    .with_color(blended_colors::text_disabled(theme, theme.surface_2()))
+    .finish();
+    let local_button = render_segment_button(
+        "Local",
+        !is_remote,
+        AIBlockAction::OrchestrateExecutionModeToggled {
+            action_id: action_id.clone(),
+            is_remote: false,
+        },
+        handles.local_toggle.clone(),
+        appearance,
+    );
+    let cloud_button = render_segment_button(
+        "Cloud",
+        is_remote,
+        AIBlockAction::OrchestrateExecutionModeToggled {
+            action_id: action_id.clone(),
+            is_remote: true,
+        },
+        handles.cloud_toggle.clone(),
+        appearance,
+    );
+    let row = Flex::row()
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_main_axis_size(MainAxisSize::Min)
+        .with_child(Container::new(label).with_margin_right(8.).finish())
+        .with_child(local_button)
+        .with_child(cloud_button)
+        .finish();
+    Container::new(row).with_margin_bottom(6.).finish()
+}
+
+fn render_picker_row(
+    label: &str,
+    value: String,
+    on_click: AIBlockAction,
+    mouse_state: MouseStateHandle,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    let theme = appearance.theme();
+    let label_el = Text::new(
+        format!("{label}:"),
+        appearance.ui_font_family(),
+        appearance.monospace_font_size(),
+    )
+    .with_color(blended_colors::text_disabled(theme, theme.surface_2()))
+    .finish();
+    let value_label = Text::new(
+        value,
+        appearance.ui_font_family(),
+        appearance.monospace_font_size(),
+    )
+    .finish();
+    let surface_2 = theme.surface_2().into();
+
+    let hoverable = Hoverable::new(mouse_state, move |_| {
+        Container::new(value_label)
+            .with_horizontal_padding(8.)
+            .with_vertical_padding(4.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+            .with_background_color(surface_2)
+            .finish()
+    })
+    .on_click(move |ctx, _, _| {
+        ctx.dispatch_typed_action(on_click.clone());
+    })
+    .with_cursor(Cursor::PointingHand)
+    .finish();
+
+    let row = Flex::row()
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_main_axis_size(MainAxisSize::Min)
+        .with_child(Container::new(label_el).with_margin_right(8.).finish())
+        .with_child(hoverable)
+        .finish();
+    Container::new(row).with_margin_bottom(4.).finish()
+}
+
+fn render_segment_button(
+    label: &str,
+    is_active: bool,
+    on_click: AIBlockAction,
+    mouse_state: MouseStateHandle,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    let theme = appearance.theme();
+    let bg = if is_active {
+        theme.surface_3().into()
+    } else {
+        theme.surface_2().into()
+    };
+    let label_owned = label.to_string();
+    let font_family = appearance.ui_font_family();
+    let font_size = appearance.monospace_font_size();
+    let hoverable = Hoverable::new(mouse_state, move |_| {
+        Container::new(Text::new(label_owned.clone(), font_family, font_size).finish())
+            .with_horizontal_padding(8.)
+            .with_vertical_padding(4.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+            .with_background_color(bg)
+            .finish()
+    })
+    .on_click(move |ctx, _, _| {
+        ctx.dispatch_typed_action(on_click.clone());
+    })
+    .with_cursor(Cursor::PointingHand)
+    .finish();
+    Container::new(hoverable).with_margin_right(4.).finish()
+}
+
+fn render_card_button(
+    label: &str,
+    on_click: AIBlockAction,
+    mouse_state: MouseStateHandle,
+    disabled: bool,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    let theme = appearance.theme();
+    let bg: ColorU = if disabled {
+        theme.surface_1().into()
+    } else {
+        theme.surface_2().into()
+    };
+    let text_color = if disabled {
+        blended_colors::text_disabled(theme, theme.surface_2())
+    } else {
+        theme.main_text_color(theme.background()).into()
+    };
+    let label_owned = label.to_string();
+    let font_family = appearance.ui_font_family();
+    let font_size = appearance.monospace_font_size();
+    let inner_factory = move || {
+        Container::new(
+            Text::new(label_owned.clone(), font_family, font_size)
+                .with_color(text_color)
+                .finish(),
+        )
+        .with_horizontal_padding(8.)
+        .with_vertical_padding(4.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+        .with_background_color(bg)
+        .finish()
+    };
+    if disabled {
+        return Container::new(inner_factory())
+            .with_margin_left(4.)
+            .finish();
+    }
+    let hoverable = Hoverable::new(mouse_state, move |_| inner_factory())
+        .on_click(move |ctx, _, _| {
+            ctx.dispatch_typed_action(on_click.clone());
+        })
+        .with_cursor(Cursor::PointingHand)
+        .finish();
+    Container::new(hoverable).with_margin_left(4.).finish()
+}
+
+fn render_validation_error(reason: &str, appearance: &Appearance) -> Box<dyn Element> {
+    let theme = appearance.theme();
+    Container::new(
+        Text::new(
+            reason.to_string(),
+            appearance.ui_font_family(),
+            appearance.monospace_font_size(),
+        )
+        .with_color(theme.ui_error_color())
+        .finish(),
+    )
+    .with_margin_top(6.)
+    .finish()
+}
+
+fn cycle_model(current: &str) -> String {
+    const MODELS: &[&str] = &["auto", "claude-sonnet-4", "claude-opus-4", "gpt-5-thinking"];
+    let idx = MODELS.iter().position(|m| *m == current).unwrap_or(0);
+    MODELS[(idx + 1) % MODELS.len()].to_string()
+}
+
+fn cycle_harness(current: &str) -> String {
+    const HARNESSES: &[&str] = &["oz", "claude", "gemini"];
+    let idx = HARNESSES
+        .iter()
+        .position(|h| h.eq_ignore_ascii_case(current))
+        .unwrap_or(0);
+    HARNESSES[(idx + 1) % HARNESSES.len()].to_string()
+}
+
+fn cycle_environment(current: &str) -> String {
+    const ENVS: &[&str] = &["", "default-env", "staging-env", "prod-env"];
+    let idx = ENVS.iter().position(|e| *e == current).unwrap_or(0);
+    ENVS[(idx + 1) % ENVS.len()].to_string()
 }
 
 #[cfg(test)]

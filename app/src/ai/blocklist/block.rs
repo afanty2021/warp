@@ -99,6 +99,7 @@ use crate::cloud_object::model::generic_string_model::GenericStringObjectId;
 use crate::cloud_object::model::persistence::CloudModel;
 use crate::code_review::telemetry_event::CodeReviewPaneEntrypoint;
 use crate::server::ids::SyncId;
+use crate::server::server_api::ServerApiProvider;
 use crate::server::telemetry::AgentModeRewindEntrypoint;
 use crate::settings::InputSettings;
 use crate::terminal::view::{CodeDiffAction, TerminalAction};
@@ -153,10 +154,11 @@ use warpui::{
 };
 
 use crate::ai::agent::{
-    AIAgentAction, AIAgentActionId, AIAgentActionType, AIAgentAttachment, AIAgentCitation,
-    AIAgentContext, AIAgentOutputMessage, AIAgentOutputMessageType, CreateDocumentsRequest,
-    CreateDocumentsResult, DocumentToCreate, EditDocumentsResult, ProgrammingLanguage,
-    RenderableAIError, RequestCommandOutputResult, SuggestedLoggingId, SummarizationType,
+    AIAgentAction, AIAgentActionId, AIAgentActionResult, AIAgentActionType, AIAgentAttachment,
+    AIAgentCitation, AIAgentContext, AIAgentOutputMessage, AIAgentOutputMessageType,
+    CreateDocumentsRequest, CreateDocumentsResult, DocumentToCreate, EditDocumentsResult,
+    ProgrammingLanguage, RenderableAIError, RequestCommandOutputResult, SuggestedLoggingId,
+    SummarizationType,
 };
 use crate::ai::blocklist::inline_action::code_diff_view;
 use crate::ai::blocklist::inline_action::requested_command::{
@@ -182,6 +184,7 @@ use crate::view_components::DismissibleToast;
 use crate::workspace::{ForkAIConversationParams, ForkedConversationDestination, WorkspaceAction};
 use crate::{report_error, report_if_error, ToastStack};
 use ai::agent::action::{AskUserQuestionItem, InsertReviewComment};
+use ai::agent::action::{OrchestrateAgentRunConfig, OrchestrateExecutionMode, OrchestrateRequest};
 
 use crate::editor::InteractionState;
 use crate::server::telemetry::{AutonomySettingToggleSource, InteractionSource};
@@ -326,6 +329,133 @@ impl AIBlockResponseRating {
 struct ActionButtons {
     run_button: CompactibleActionButton,
     cancel_button: CompactibleActionButton,
+}
+
+/// Per-action edit state for the `orchestrate` tool call's inline
+/// confirmation card. Kept on `AIBlock` and updated in response to picker
+/// actions while the editor is open. `dispatch_orchestrate` is invoked from
+/// these values when the user clicks Accept.
+///
+/// Spec references: TECH.md §8 ("Client: confirmation card"), PRODUCT.md
+/// "Confirmation card actions".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct OrchestrateEditState {
+    /// Whether the inline editor is currently visible. Toggled by the Edit
+    /// button.
+    pub(super) is_editor_open: bool,
+    /// Currently-selected model_id for run-wide config. Initialized from
+    /// the LLM-supplied `OrchestrateRequest.model_id`.
+    pub(super) model_id: String,
+    /// Currently-selected harness_type. Initialized from the LLM-supplied
+    /// `OrchestrateRequest.harness_type`.
+    pub(super) harness_type: String,
+    /// Currently-selected execution mode (Local or Remote{env, host, ...}).
+    pub(super) execution_mode: OrchestrateExecutionMode,
+    /// Per-agent run configs (passed straight through; not user-editable in
+    /// Stage 1).
+    pub(super) agent_run_configs: Vec<OrchestrateAgentRunConfig>,
+    /// Run-wide base prompt (passed through verbatim).
+    pub(super) base_prompt: String,
+    /// Summary text rendered in the title row.
+    pub(super) summary: String,
+}
+
+impl OrchestrateEditState {
+    pub(super) fn from_request(req: &OrchestrateRequest) -> Self {
+        Self {
+            is_editor_open: false,
+            model_id: req.model_id.clone(),
+            harness_type: req.harness_type.clone(),
+            execution_mode: req.execution_mode.clone(),
+            agent_run_configs: req.agent_run_configs.clone(),
+            base_prompt: req.base_prompt.clone(),
+            summary: req.summary.clone(),
+        }
+    }
+
+    /// Toggle Local <-> Cloud. Per spec §8, OpenCode harness is not
+    /// supported on Cloud; toggling Local→Cloud while OpenCode is selected
+    /// resets the harness to Oz.
+    pub(super) fn toggle_execution_mode_to_remote(&mut self, is_remote: bool) {
+        if is_remote {
+            // Local → Cloud: reset OpenCode to Oz per spec.
+            if self.harness_type.eq_ignore_ascii_case("opencode") {
+                self.harness_type = "oz".to_string();
+            }
+            // Initialize Remote with default empty fields and
+            // worker_host="warp" (TODO(QUALITY-569 fast-follow): expose
+            // worker_host as an editable picker).
+            if !self.execution_mode.is_remote() {
+                self.execution_mode = OrchestrateExecutionMode::Remote {
+                    environment_id: String::new(),
+                    worker_host: "warp".to_string(),
+                    computer_use_enabled: false,
+                };
+            }
+        } else {
+            self.execution_mode = OrchestrateExecutionMode::Local;
+        }
+    }
+
+    pub(super) fn set_environment_id(&mut self, environment_id: String) {
+        if let OrchestrateExecutionMode::Remote {
+            environment_id: id, ..
+        } = &mut self.execution_mode
+        {
+            *id = environment_id;
+        }
+    }
+
+    /// Returns Some(reason) if Accept must be disabled, None if it's
+    /// enabled. Spec §8: Cloud-without-env and OpenCode+Cloud both block
+    /// Accept and surface inline error text.
+    pub(super) fn accept_disabled_reason(&self) -> Option<&'static str> {
+        match &self.execution_mode {
+            OrchestrateExecutionMode::Remote { environment_id, .. }
+                if environment_id.trim().is_empty() =>
+            {
+                Some("Select an environment to launch on Cloud.")
+            }
+            OrchestrateExecutionMode::Remote { .. }
+                if self.harness_type.eq_ignore_ascii_case("opencode") =>
+            {
+                Some("OpenCode is not supported on Cloud yet. Switch to Local or pick a different harness.")
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn to_request(&self) -> OrchestrateRequest {
+        OrchestrateRequest {
+            summary: self.summary.clone(),
+            base_prompt: self.base_prompt.clone(),
+            skills: Vec::new(),
+            model_id: self.model_id.clone(),
+            harness_type: self.harness_type.clone(),
+            execution_mode: self.execution_mode.clone(),
+            agent_run_configs: self.agent_run_configs.clone(),
+            auto_launch: false,
+        }
+    }
+}
+
+/// `MouseStateHandle`s for the per-action Reject/Edit/Accept buttons + the
+/// per-action Local/Cloud toggle and picker rows used inside the inline
+/// editor. Per-picker `Dropdown` views are intentionally NOT stored here;
+/// the picker integration uses simpler `MouseStateHandle`-driven cycle
+/// buttons (TODO(QUALITY-569 fast-follow): swap in real `Dropdown` views
+/// once the model/harness/environment list rendering is consolidated
+/// behind a reusable component).
+#[derive(Default, Clone)]
+pub(super) struct OrchestrateCardHandles {
+    pub(super) reject_button: MouseStateHandle,
+    pub(super) edit_button: MouseStateHandle,
+    pub(super) accept_button: MouseStateHandle,
+    pub(super) local_toggle: MouseStateHandle,
+    pub(super) cloud_toggle: MouseStateHandle,
+    pub(super) model_picker: MouseStateHandle,
+    pub(super) harness_picker: MouseStateHandle,
+    pub(super) environment_picker: MouseStateHandle,
 }
 
 /// Like `SecondaryTheme` but with grey text instead of white.
@@ -936,6 +1066,15 @@ pub struct AIBlock {
     imported_comments: HashMap<AIAgentActionId, ImportedCommentGroup>,
     has_imported_comments: bool,
 
+    /// Per-action edit state for `orchestrate` tool calls. Lazily
+    /// populated when the user first opens the inline editor on a
+    /// confirmation card. Keyed by `AIAgentActionId`.
+    orchestrate_edit_states: HashMap<AIAgentActionId, OrchestrateEditState>,
+    /// Per-action `MouseStateHandle`s for the `orchestrate` confirmation
+    /// card's interactive controls. Lazily populated alongside
+    /// `orchestrate_edit_states`.
+    orchestrate_card_handles: HashMap<AIAgentActionId, OrchestrateCardHandles>,
+
     /// Handle for the background link detection task, kept so we can abort a previous
     /// detection when a new one is spawned (e.g. on shell data change).
     link_detection_handle: Option<SpawnedFutureHandle>,
@@ -1353,6 +1492,8 @@ impl AIBlock {
             aws_bedrock_credentials_error_view: None,
             imported_comments: Default::default(),
             has_imported_comments: false,
+            orchestrate_edit_states: Default::default(),
+            orchestrate_card_handles: Default::default(),
             link_detection_handle: None,
             #[cfg(feature = "local_fs")]
             resolved_code_block_paths: Default::default(),
@@ -5724,6 +5865,47 @@ pub enum AIBlockAction {
     OpenCommentInGitHub {
         url: String,
     },
+
+    // ----- orchestrate tool call confirmation card -----
+    /// Reject the orchestrate tool call. Cancels the action via the
+    /// existing `cancel_action_with_id` path; no proto fan-out happens
+    /// because `OrchestrateResult::Cancelled` is `ConvertToAPITypeError::Ignore`.
+    OrchestrateReject {
+        action_id: AIAgentActionId,
+    },
+    /// Accept the orchestrate tool call. Builds an `OrchestrateRequest`
+    /// from the current edit state, dispatches per-agent
+    /// `CreateAgentTask` calls in parallel via `dispatch_orchestrate`,
+    /// then injects the resulting `OrchestrateResult` into the action
+    /// model.
+    OrchestrateAccept {
+        action_id: AIAgentActionId,
+    },
+    /// Toggle the inline editor open/closed for an orchestrate card.
+    /// Lazily initializes per-action edit state on first toggle-open.
+    OrchestrateToggleEdit {
+        action_id: AIAgentActionId,
+    },
+    /// Toggle Local <-> Cloud execution mode in the inline editor.
+    OrchestrateExecutionModeToggled {
+        action_id: AIAgentActionId,
+        is_remote: bool,
+    },
+    /// User selected a different model in the inline editor.
+    OrchestrateModelChanged {
+        action_id: AIAgentActionId,
+        model_id: String,
+    },
+    /// User selected a different harness in the inline editor.
+    OrchestrateHarnessChanged {
+        action_id: AIAgentActionId,
+        harness_type: String,
+    },
+    /// User selected a different environment_id in the inline editor.
+    OrchestrateEnvironmentChanged {
+        action_id: AIAgentActionId,
+        environment_id: String,
+    },
 }
 
 impl TypedActionView for AIBlock {
@@ -6373,8 +6555,154 @@ impl TypedActionView for AIBlock {
                     initial_index,
                 });
             }
+            AIBlockAction::OrchestrateReject { action_id } => {
+                self.cancel_action(action_id, ctx);
+            }
+            AIBlockAction::OrchestrateToggleEdit { action_id } => {
+                self.handle_orchestrate_toggle_edit(action_id, ctx);
+            }
+            AIBlockAction::OrchestrateExecutionModeToggled {
+                action_id,
+                is_remote,
+            } => {
+                if let Some(state) = self.orchestrate_edit_states.get_mut(action_id) {
+                    state.toggle_execution_mode_to_remote(*is_remote);
+                }
+            }
+            AIBlockAction::OrchestrateModelChanged {
+                action_id,
+                model_id,
+            } => {
+                if let Some(state) = self.orchestrate_edit_states.get_mut(action_id) {
+                    state.model_id = model_id.clone();
+                }
+            }
+            AIBlockAction::OrchestrateHarnessChanged {
+                action_id,
+                harness_type,
+            } => {
+                if let Some(state) = self.orchestrate_edit_states.get_mut(action_id) {
+                    state.harness_type = harness_type.clone();
+                }
+            }
+            AIBlockAction::OrchestrateEnvironmentChanged {
+                action_id,
+                environment_id,
+            } => {
+                if let Some(state) = self.orchestrate_edit_states.get_mut(action_id) {
+                    state.set_environment_id(environment_id.clone());
+                }
+            }
+            AIBlockAction::OrchestrateAccept { action_id } => {
+                self.handle_orchestrate_accept(action_id, ctx);
+            }
         }
         ctx.notify();
+    }
+}
+
+impl AIBlock {
+    fn handle_orchestrate_toggle_edit(
+        &mut self,
+        action_id: &AIAgentActionId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // Lazily initialize edit state from the live OrchestrateRequest on
+        // the pending action the first time the user clicks Edit. The
+        // request is cloned so subsequent stream updates don't clobber
+        // user-edited fields.
+        if !self.orchestrate_edit_states.contains_key(action_id) {
+            let req = self
+                .action_model
+                .as_ref(ctx)
+                .get_pending_action_by_id(action_id)
+                .and_then(|action| match &action.action {
+                    AIAgentActionType::Orchestrate(req) => Some(req.clone()),
+                    _ => None,
+                });
+            let Some(req) = req else {
+                log::warn!(
+                    "OrchestrateToggleEdit: no pending Orchestrate action found for id={action_id:?}"
+                );
+                return;
+            };
+            self.orchestrate_edit_states
+                .insert(action_id.clone(), OrchestrateEditState::from_request(&req));
+        }
+
+        if let Some(state) = self.orchestrate_edit_states.get_mut(action_id) {
+            state.is_editor_open = !state.is_editor_open;
+        }
+    }
+
+    fn handle_orchestrate_accept(
+        &mut self,
+        action_id: &AIAgentActionId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // Validation gate: per spec §8, Cloud-without-env and OpenCode+Cloud
+        // disable Accept and surface inline error text. Clicks bypass the
+        // gate (e.g. via keyboard shortcut) bail out here too.
+        if let Some(state) = self.orchestrate_edit_states.get(action_id) {
+            if state.accept_disabled_reason().is_some() {
+                return;
+            }
+        }
+
+        // Source the request: prefer edited state, fall back to the live
+        // pending action so a never-edited card still launches with the
+        // LLM-supplied defaults.
+        let pending_request = self
+            .action_model
+            .as_ref(ctx)
+            .get_pending_action_by_id(action_id)
+            .and_then(|action| match &action.action {
+                AIAgentActionType::Orchestrate(req) => Some((req.clone(), action.task_id.clone())),
+                _ => None,
+            });
+        let Some((live_request, task_id)) = pending_request else {
+            log::warn!(
+                "OrchestrateAccept: no pending Orchestrate action found for id={action_id:?}"
+            );
+            return;
+        };
+
+        let request = self
+            .orchestrate_edit_states
+            .get(action_id)
+            .map(|state| state.to_request())
+            .unwrap_or(live_request);
+
+        // Capture the parent run_id (if any) so child agents link back to
+        // their orchestrator. Mirrors `start_agent::execute` which sources
+        // this from `BlocklistAIHistoryModel`.
+        let parent_run_id = BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&self.client_ids.conversation_id)
+            .and_then(|c| c.run_id());
+
+        let ai_client = ServerApiProvider::as_ref(ctx).get_ai_client();
+        let conversation_id = self.client_ids.conversation_id;
+        let action_id_for_result = action_id.clone();
+
+        let dispatch_inputs = crate::ai::blocklist::orchestrate_dispatch::DispatchInputs {
+            request,
+            client: ai_client,
+            parent_run_id,
+        };
+
+        ctx.spawn(
+            crate::ai::blocklist::orchestrate_dispatch::dispatch_orchestrate(dispatch_inputs),
+            move |me, result, ctx| {
+                let action_result = AIAgentActionResult {
+                    id: action_id_for_result.clone(),
+                    task_id,
+                    result: AIAgentActionResultType::Orchestrate(result),
+                };
+                me.action_model.update(ctx, |action_model, ctx| {
+                    action_model.apply_finished_action_result(conversation_id, action_result, ctx);
+                });
+            },
+        );
     }
 }
 
