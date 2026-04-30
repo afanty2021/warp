@@ -137,9 +137,8 @@ fn render_confirmation_card(
 }
 
 fn render_header(handles: &OrchestrateCardHandles, app: &AppContext) -> Box<dyn Element> {
-    let appearance = Appearance::as_ref(app);
     let mut config = HeaderConfig::new(ORCHESTRATE_CARD_TITLE, app)
-        .with_icon(icons::yellow_stop_icon(appearance))
+        .with_icon(icons::orchestrate_stop_icon())
         .with_corner_radius_override(CornerRadius::with_top(Radius::Pixels(8.)));
 
     if let (Some(reject), Some(edit), Some(accept)) = (
