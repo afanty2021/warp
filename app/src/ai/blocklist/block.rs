@@ -146,7 +146,7 @@ use warpui::{
     clipboard::ClipboardContent,
     elements::{MouseStateHandle, SelectionBound, SelectionHandle},
     image_cache::ImageType,
-    keymap::FixedBinding,
+    keymap::{FixedBinding, Keystroke},
     r#async::{SpawnedFutureHandle, Timer},
     text::SelectionType,
     AppContext, Entity, EntityId, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext,
@@ -191,6 +191,7 @@ use crate::ai::agent_conversations_model::AgentConversationsModel;
 use crate::ai::execution_profiles::model_menu_items::available_model_menu_items;
 use crate::ai::harness_display;
 use crate::menu::{MenuItem, MenuItemFields};
+use crate::view_components::compactible_split_action_button::CompactibleSplitActionButton;
 use crate::view_components::dropdown::{Dropdown, DropdownAction, DropdownStyle};
 use crate::view_components::FilterableDropdown;
 
@@ -451,18 +452,19 @@ impl OrchestrateEditState {
 
 /// Per-action UI handles for the `orchestrate` confirmation card.
 ///
-/// Holds `MouseStateHandle`s for the Reject/Edit/Accept buttons + the
-/// Local/Cloud toggle, plus the lazily-created picker `ViewHandle`s for
-/// the inline editor (model/harness `Dropdown`s and a filterable env
-/// `FilterableDropdown`). Picker handles are `Option<...>` because they
-/// are constructed on-demand the first time the user opens the editor;
-/// reusing the same handles across re-renders keeps the dropdowns'
-/// internal selection/focus state stable.
+/// Holds the `CompactibleActionButton` views for Reject and Edit, the
+/// `CompactibleSplitActionButton` for Accept (the chevron-down chip is a
+/// no-op TODO for now), `MouseStateHandle`s for the Local/Cloud toggle
+/// inside the inline editor, and the lazily-created picker `ViewHandle`s
+/// for the inline editor (model/harness `Dropdown`s and a filterable env
+/// `FilterableDropdown`). Each field is `Option<...>` so the entry can be
+/// `Default`-constructed before `ensure_orchestrate_card_buttons` /
+/// `ensure_orchestrate_pickers` populate it under a `&mut ViewContext`.
 #[derive(Default, Clone)]
 pub(super) struct OrchestrateCardHandles {
-    pub(super) reject_button: MouseStateHandle,
-    pub(super) edit_button: MouseStateHandle,
-    pub(super) accept_button: MouseStateHandle,
+    pub(super) reject_button: Option<CompactibleActionButton>,
+    pub(super) edit_button: Option<CompactibleActionButton>,
+    pub(super) accept_button: Option<CompactibleSplitActionButton>,
     pub(super) local_toggle: MouseStateHandle,
     pub(super) cloud_toggle: MouseStateHandle,
     pub(super) model_picker: Option<ViewHandle<Dropdown<AIBlockAction>>>,
@@ -1999,6 +2001,13 @@ impl AIBlock {
                     .orchestration_navigation_card_handles
                     .entry(action.id.clone())
                     .or_default();
+            }
+
+            // Ensure the per-action Reject/Edit/Accept button views exist so
+            // the orchestrate confirmation card can render them on its first
+            // frame. Pickers stay lazy (built on first Edit-open).
+            if matches!(&action.action, AIAgentActionType::Orchestrate(_)) {
+                self.ensure_orchestrate_card_buttons(&action.id, ctx);
             }
 
             // Ensure a button component exists for UseComputer actions.
@@ -5918,6 +5927,12 @@ pub enum AIBlockAction {
         action_id: AIAgentActionId,
         environment_id: String,
     },
+    /// User clicked the Accept split-button's chevron-down dropdown
+    /// affordance. Currently a no-op; the dropdown content is a
+    /// fast-follow per the Stage 1 visual rework spec.
+    OrchestrateAcceptMenuToggled {
+        action_id: AIAgentActionId,
+    },
 }
 
 impl TypedActionView for AIBlock {
@@ -6612,12 +6627,100 @@ impl TypedActionView for AIBlock {
             AIBlockAction::OrchestrateAccept { action_id } => {
                 self.handle_orchestrate_accept(action_id, ctx);
             }
+            AIBlockAction::OrchestrateAcceptMenuToggled { action_id: _ } => {
+                // TODO(QUALITY-569 fast-follow): wire the Accept split
+                // button's chevron-down dropdown content. The visual
+                // structure already matches the Figma; the menu items
+                // (e.g. "Accept and \u2026") have not been speced yet.
+            }
         }
         ctx.notify();
     }
 }
 
 impl AIBlock {
+    /// Lazily build the Reject / Edit / Accept button views for an
+    /// orchestrate confirmation card. Called when an Orchestrate action
+    /// is observed in the streaming output so the card can render the
+    /// buttons on its first frame. Idempotent: re-running with a
+    /// populated entry leaves it unchanged.
+    fn ensure_orchestrate_card_buttons(
+        &mut self,
+        action_id: &AIAgentActionId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let needs_buttons = self
+            .orchestrate_card_handles
+            .get(action_id)
+            .is_none_or(|h| {
+                h.reject_button.is_none() || h.edit_button.is_none() || h.accept_button.is_none()
+            });
+        if !needs_buttons {
+            return;
+        }
+
+        let reject_keystroke = Keystroke {
+            key: "c".to_owned(),
+            ..Default::default()
+        };
+        let edit_keystroke =
+            Keystroke::parse("cmdorctrl-e").expect("orchestrate edit keystroke literal must parse");
+        let accept_keystroke =
+            Keystroke::parse("alt-enter").expect("orchestrate accept keystroke literal must parse");
+
+        let reject_button = CompactibleActionButton::new(
+            "Reject".to_string(),
+            Some(KeystrokeSource::Fixed(reject_keystroke)),
+            ButtonSize::InlineActionHeader,
+            AIBlockAction::OrchestrateReject {
+                action_id: action_id.clone(),
+            },
+            Icon::X,
+            Arc::new(NakedTheme),
+            ctx,
+        );
+        let edit_button = CompactibleActionButton::new(
+            "Edit".to_string(),
+            Some(KeystrokeSource::Fixed(edit_keystroke)),
+            ButtonSize::InlineActionHeader,
+            AIBlockAction::OrchestrateToggleEdit {
+                action_id: action_id.clone(),
+            },
+            Icon::Pencil,
+            Arc::new(NakedTheme),
+            ctx,
+        );
+        let accept_button = CompactibleSplitActionButton::new(
+            "Accept".to_string(),
+            Some(KeystrokeSource::Fixed(accept_keystroke)),
+            ButtonSize::InlineActionHeader,
+            AIBlockAction::OrchestrateAccept {
+                action_id: action_id.clone(),
+            },
+            AIBlockAction::OrchestrateAcceptMenuToggled {
+                action_id: action_id.clone(),
+            },
+            Icon::Check,
+            true,
+            None,
+            ctx,
+        );
+
+        let entry = self
+            .orchestrate_card_handles
+            .entry(action_id.clone())
+            .or_default();
+        if entry.reject_button.is_none() {
+            entry.reject_button = Some(reject_button);
+        }
+        if entry.edit_button.is_none() {
+            entry.edit_button = Some(edit_button);
+        }
+        if entry.accept_button.is_none() {
+            entry.accept_button = Some(accept_button);
+        }
+    }
+
     fn handle_orchestrate_toggle_edit(
         &mut self,
         action_id: &AIAgentActionId,
