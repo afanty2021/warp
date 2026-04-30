@@ -67,10 +67,6 @@ pub(super) fn render_orchestrate(
     let appearance = Appearance::as_ref(app);
     let status = props.action_model.as_ref(app).get_action_status(action_id);
 
-    if props.model.status(app).is_streaming() {
-        return render_streaming_placeholder(req, appearance, app);
-    }
-
     if let Some(AIActionStatus::Finished(result)) = &status {
         if let AIAgentActionResultType::Orchestrate(orchestrate_result) = &result.result {
             return render_terminal_state(req, orchestrate_result, appearance, app);
@@ -84,7 +80,11 @@ pub(super) fn render_orchestrate(
 
     // Pre-dispatch confirmation layout. Pulls per-action edit state +
     // button handles from the AIBlock; the LLM-supplied request is the
-    // source of truth until the user clicks Edit.
+    // source of truth until the user clicks Edit. Per the polish round
+    // (P2.4) we no longer render a separate "Preparing orchestration..."
+    // placeholder during streaming — the confirmation card stands in for
+    // that intermediate state, mirroring how the edit/apply-diff
+    // tool-call card behaves before the user accepts.
     let display_state = props
         .orchestrate_edit_states
         .get(action_id)
@@ -253,20 +253,6 @@ fn render_agents_section(state: &OrchestrateEditState, app: &AppContext) -> Box<
         .finish()
 }
 
-fn render_streaming_placeholder(
-    req: &OrchestrateRequest,
-    appearance: &Appearance,
-    app: &AppContext,
-) -> Box<dyn Element> {
-    let count = req.agent_run_configs.len();
-    let label = if count == 0 {
-        "Preparing orchestration...".to_string()
-    } else {
-        format!("Preparing orchestration for {count} agent(s)...")
-    };
-    render_status_only_card(label, appearance, StatusKind::Pending, app)
-}
-
 fn render_terminal_state(
     req: &OrchestrateRequest,
     result: &OrchestrateResult,
@@ -280,10 +266,16 @@ fn render_terminal_state(
                 .iter()
                 .filter(|a| matches!(a.kind, OrchestrateAgentOutcomeKind::Launched { .. }))
                 .count();
+            // Per P2.3, all-success uses "Spawned N agent(s)" with proper
+            // pluralization; mixed uses "Spawned X of Y agents".
             let label = if launched == total {
-                format!("Started {total} agent(s)")
+                if total == 1 {
+                    "Spawned 1 agent".to_string()
+                } else {
+                    format!("Spawned {total} agents")
+                }
             } else {
-                format!("Started {launched} of {total} agent(s)")
+                format!("Spawned {launched} of {total} agents")
             };
             render_status_only_card(
                 label,
@@ -327,7 +319,6 @@ fn render_terminal_state(
 
 #[derive(Clone, Copy)]
 enum StatusKind {
-    Pending,
     Success,
     Mixed,
     Failure,
@@ -342,7 +333,7 @@ fn render_status_only_card(
 ) -> Box<dyn Element> {
     let theme = appearance.theme();
     let icon = match kind {
-        StatusKind::Pending | StatusKind::Mixed => icons::yellow_running_icon(appearance).finish(),
+        StatusKind::Mixed => icons::yellow_running_icon(appearance).finish(),
         StatusKind::Success => inline_action_icons::green_check_icon(appearance).finish(),
         StatusKind::Failure => inline_action_icons::red_x_icon(appearance).finish(),
         StatusKind::Cancelled => inline_action_icons::cancelled_icon(appearance).finish(),
@@ -356,9 +347,14 @@ fn render_status_only_card(
         false,
         app,
     );
+    // Match the confirmation card's outer spacing (P2.6) so the post-action
+    // card sits in the same indentation lane and has consistent bottom
+    // breathing room before the next output item.
     Container::new(row)
         .with_background_color(blended_colors::neutral_2(theme))
         .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+        .finish()
+        .with_agent_output_item_spacing(app)
         .finish()
 }
 

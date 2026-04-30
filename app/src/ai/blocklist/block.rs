@@ -6663,10 +6663,12 @@ impl AIBlock {
             return;
         }
 
-        let reject_keystroke = Keystroke {
-            key: "c".to_owned(),
-            ..Default::default()
-        };
+        // Reject defaults to Ctrl-C (rendered as `⌃C` on Mac, `Ctrl C`
+        // elsewhere) per the polish round (P2.2). When the inline editor
+        // is open the button label/keystroke swaps to "Discard edits" /
+        // Esc via `sync_orchestrate_card_buttons` (see P2.5).
+        let reject_keystroke =
+            Keystroke::parse("ctrl-c").expect("orchestrate reject keystroke literal must parse");
         let edit_keystroke =
             Keystroke::parse("cmdorctrl-e").expect("orchestrate edit keystroke literal must parse");
         let accept_keystroke =
@@ -6769,6 +6771,54 @@ impl AIBlock {
             .is_some_and(|s| s.is_editor_open)
         {
             self.ensure_orchestrate_pickers(action_id, ctx);
+        }
+
+        // Swap Reject ↔ Discard-edits label + shortcut chip based on
+        // whether the editor is open (P2.5).
+        self.sync_orchestrate_card_buttons(action_id, ctx);
+    }
+
+    /// Update the Reject (and, eventually, Edit) button labels/keystrokes
+    /// on the orchestrate confirmation card to reflect the current
+    /// `OrchestrateEditState`. Specifically, when the inline editor is
+    /// open the Reject button becomes "Discard edits" with an `Esc`
+    /// shortcut chip; when it's closed it reverts to "Reject" with
+    /// `Ctrl-C`. Idempotent and safe to call repeatedly; if the buttons
+    /// or edit state for the action are missing this is a no-op.
+    fn sync_orchestrate_card_buttons(
+        &mut self,
+        action_id: &AIAgentActionId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let is_editor_open = self
+            .orchestrate_edit_states
+            .get(action_id)
+            .is_some_and(|s| s.is_editor_open);
+        let Some(handles) = self.orchestrate_card_handles.get(action_id).cloned() else {
+            return;
+        };
+        let Some(mut reject_button) = handles.reject_button else {
+            return;
+        };
+        let (label, keystroke) = if is_editor_open {
+            (
+                "Discard edits".to_string(),
+                Keystroke::parse("escape")
+                    .expect("orchestrate discard-edits keystroke literal must parse"),
+            )
+        } else {
+            (
+                "Reject".to_string(),
+                Keystroke::parse("ctrl-c")
+                    .expect("orchestrate reject keystroke literal must parse"),
+            )
+        };
+        reject_button.set_label(label, ctx);
+        reject_button.set_keybinding(Some(KeystrokeSource::Fixed(keystroke)), ctx);
+        // Persist the mutated handle back into the per-action map so
+        // subsequent renders see the updated label/keystroke.
+        if let Some(entry) = self.orchestrate_card_handles.get_mut(action_id) {
+            entry.reject_button = Some(reject_button);
         }
     }
 
