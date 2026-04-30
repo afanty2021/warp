@@ -22,7 +22,7 @@ use crate::{
         ambient_agents::{task::HarnessConfig, AgentConfigSnapshot},
         blocklist::{
             agent_view::AgentViewEntryOrigin, orchestration_events::OrchestrationEventService,
-            BlocklistAIHistoryModel, StartAgentRequest,
+            BlocklistAIHistoryModel, StartAgentExecutor, StartAgentRequest,
         },
         llms::LLMPreferences,
         skills::SkillManager,
@@ -1115,12 +1115,13 @@ fn handle_terminal_view_event(
                     log::warn!("No hidden pane found for child conversation {conversation_id:?}");
                 }
             }
-            Event::StartAgentConversation(request) => {
+            Event::StartAgentConversation { request, executor } => {
                 dispatch_start_agent_conversation(
                     group,
                     pane_id,
                     terminal_pane_id,
                     request.clone(),
+                    executor.clone(),
                     ctx,
                 );
             }
@@ -1135,16 +1136,25 @@ fn handle_terminal_view_event(
 /// helper. Behavior is identical to the previous inline match — the helpers
 /// are extracted free functions so the orchestrate Accept path can fan out
 /// N requests through them without duplicating pane-creation logic.
+///
+/// The executor handle is plumbed through so each helper can echo the
+/// freshly-created child conversation id back to the executor's pending
+/// table via [`StartAgentExecutor::record_child_conversation`]. This is
+/// the disambiguator that lets the executor's history-event handler know
+/// which pending request a `ConversationServerTokenAssigned` /
+/// `UpdatedConversationStatus` event refers to when N requests are in
+/// flight in parallel.
 fn dispatch_start_agent_conversation(
     group: &mut PaneGroup,
     parent_pane_id: PaneId,
     terminal_pane_id: TerminalPaneId,
     request: StartAgentRequest,
+    executor: ModelHandle<StartAgentExecutor>,
     ctx: &mut ViewContext<PaneGroup>,
 ) {
     match request.execution_mode.clone() {
         StartAgentExecutionMode::Local { harness_type: None } => {
-            launch_local_no_harness_child(group, parent_pane_id, request, ctx);
+            launch_local_no_harness_child(group, parent_pane_id, request, executor, ctx);
         }
         #[cfg(not(target_family = "wasm"))]
         StartAgentExecutionMode::Local {
@@ -1156,11 +1166,16 @@ fn dispatch_start_agent_conversation(
                 terminal_pane_id,
                 request,
                 harness_type,
+                executor,
                 ctx,
             );
         }
         #[cfg(target_family = "wasm")]
         StartAgentExecutionMode::Local { .. } => {
+            // Discard the executor handle: WASM never gets a chance to record
+            // a child conversation id; the pending request simply stays in
+            // the executor until its async receiver is dropped.
+            let _ = executor;
             create_error_child_agent_conversation(
                 group,
                 parent_pane_id,
@@ -1192,6 +1207,7 @@ fn dispatch_start_agent_conversation(
                     harness_type,
                     title,
                 },
+                executor,
                 ctx,
             );
         }
@@ -1203,12 +1219,20 @@ fn dispatch_start_agent_conversation(
 /// Returns the freshly-created `AIConversationId` on success, or `None` if
 /// pane creation failed (the failure path matches the previous inline arm,
 /// which silently returned without creating a fallback error pane).
+///
+/// On success the freshly-created child conversation id is echoed back to
+/// the executor's pending table via
+/// [`StartAgentExecutor::record_child_conversation`] so subsequent
+/// `ConversationServerTokenAssigned` / `UpdatedConversationStatus` history
+/// events can be matched back to this request.
 fn launch_local_no_harness_child(
     group: &mut PaneGroup,
     parent_pane_id: PaneId,
     request: StartAgentRequest,
+    executor: ModelHandle<StartAgentExecutor>,
     ctx: &mut ViewContext<PaneGroup>,
 ) -> Option<AIConversationId> {
+    let request_id = request.id;
     let HiddenChildAgentConversation {
         terminal_view: new_terminal_view,
         conversation_id,
@@ -1221,6 +1245,10 @@ fn launch_local_no_harness_child(
         HashMap::new(),
         ctx,
     )?;
+
+    executor.update(ctx, |executor, _| {
+        executor.record_child_conversation(request_id, conversation_id);
+    });
 
     register_legacy_local_lifecycle_subscription(
         request.parent_conversation_id,
@@ -1253,6 +1281,11 @@ fn launch_local_no_harness_child(
 /// initial spawn is fire-and-forget; success or failure flows back through
 /// the shared `BlocklistAIHistoryModel` events that `StartAgentExecutor`
 /// observes.
+///
+/// The executor handle and request id are captured into the post-spawn
+/// callback so the freshly-created child conversation id can be echoed
+/// back via [`StartAgentExecutor::record_child_conversation`] before the
+/// launch command is executed.
 #[cfg(not(target_family = "wasm"))]
 fn launch_local_harness_child(
     group: &mut PaneGroup,
@@ -1260,10 +1293,12 @@ fn launch_local_harness_child(
     terminal_pane_id: TerminalPaneId,
     request: StartAgentRequest,
     harness_type: String,
+    executor: ModelHandle<StartAgentExecutor>,
     ctx: &mut ViewContext<PaneGroup>,
 ) {
     let startup_directory = group.startup_path_for_new_session(Some(terminal_pane_id), ctx);
     let ai_client = ServerApiProvider::handle(ctx).as_ref(ctx).get_ai_client();
+    let request_id = request.id;
     let request_name = request.name.clone();
     let parent_conversation_id = request.parent_conversation_id;
     let parent_run_id = request.parent_run_id.clone();
@@ -1307,6 +1342,10 @@ fn launch_local_harness_child(
                     env_vars,
                     ctx,
                 ) {
+                    executor.update(ctx, |executor, _| {
+                        executor.record_child_conversation(request_id, conversation_id);
+                    });
+
                     BlocklistAIHistoryModel::handle(ctx).update(ctx, |history_model, ctx| {
                         history_model.assign_run_id_for_conversation(
                             conversation_id,
@@ -1369,11 +1408,19 @@ struct RemoteLaunchFields {
 /// `SpawnAgentRequest`, enters the agent view, and kicks off the spawn via
 /// the ambient agent view model. Returns the freshly-created
 /// `AIConversationId` on success.
+///
+/// The executor handle is used to echo the child conversation id back to
+/// the executor's pending table via
+/// [`StartAgentExecutor::record_child_conversation`] so the
+/// `ConversationServerTokenAssigned` event that fires when
+/// `model.spawn_agent_with_request` resolves can be matched back to this
+/// request.
 fn launch_remote_child(
     group: &mut PaneGroup,
     parent_pane_id: PaneId,
     request: StartAgentRequest,
     fields: RemoteLaunchFields,
+    executor: ModelHandle<StartAgentExecutor>,
     ctx: &mut ViewContext<PaneGroup>,
 ) -> Option<AIConversationId> {
     let RemoteLaunchFields {
@@ -1386,6 +1433,7 @@ fn launch_remote_child(
         title,
     } = fields;
 
+    let request_id = request.id;
     let Some(parent_run_id) = request.parent_run_id.clone() else {
         log::error!(
             "Remote StartAgent request missing parent_run_id for {:?}",
@@ -1416,6 +1464,10 @@ fn launch_remote_child(
             c.mark_as_remote_child();
         }
         id
+    });
+
+    executor.update(ctx, |executor, _| {
+        executor.record_child_conversation(request_id, conversation_id);
     });
 
     let runtime_skills = match resolve_runtime_skills(&skill_references, ctx) {

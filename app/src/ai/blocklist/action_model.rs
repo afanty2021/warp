@@ -34,7 +34,7 @@ pub use execute::{
     EditResolvedEvent, EditStats, NewConversationDecision, PromptSuggestionExecutor,
     ReadFileContextResult, RequestFileEditsExecutor, RequestFileEditsFormatKind,
     RequestFileEditsTelemetryEvent, ShellCommandExecutor, ShellCommandExecutorEvent,
-    StartAgentExecutor, StartAgentExecutorEvent, StartAgentRequest,
+    StartAgentExecutor, StartAgentExecutorEvent, StartAgentRequest, StartAgentRequestId,
 };
 
 use futures::future::{join_all, BoxFuture};

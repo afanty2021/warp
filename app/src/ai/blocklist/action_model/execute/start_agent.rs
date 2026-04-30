@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use futures::{future::BoxFuture, FutureExt};
 use warpui::{Entity, ModelContext, SingletonEntity};
 
@@ -31,10 +33,38 @@ fn invalid_local_child_harness_error(harness_type: &str) -> String {
     }
 }
 
+/// Opaque, monotonically increasing identifier minted by
+/// [`StartAgentExecutor::execute`] for each in-flight StartAgent request.
+///
+/// Embedded in [`StartAgentRequest`] so the executor can disambiguate
+/// per-request side effects when multiple requests are in flight in
+/// parallel (e.g. the orchestrate Accept fan-out spawns N concurrent
+/// StartAgents that all share the same `parent_conversation_id`). The
+/// terminal pane echoes this id back via
+/// [`StartAgentExecutor::record_child_conversation`] once the synchronously-
+/// created child conversation id is known, replacing the previous
+/// `parent_conversation_id`-only matching heuristic.
+#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, Default)]
+pub struct StartAgentRequestId(u64);
+
+impl StartAgentRequestId {
+    /// Convenience constructor for tests that need to supply a fixed id
+    /// outside the executor's monotonic counter. `const fn` so callers
+    /// can declare module-level `const`s without going through `lazy_static`.
+    #[cfg(test)]
+    pub const fn from_raw_for_test(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 /// Groups the data for a single StartAgent invocation as it flows from the
 /// executor through the terminal view and pane group into the controller.
 #[derive(Clone)]
 pub struct StartAgentRequest {
+    /// Executor-minted request identifier. Plumbed back through
+    /// [`StartAgentExecutor::record_child_conversation`] so per-request
+    /// pendings are disambiguated when N requests run in parallel.
+    pub id: StartAgentRequestId,
     pub name: String,
     pub prompt: String,
     pub execution_mode: StartAgentExecutionMode,
@@ -43,19 +73,25 @@ pub struct StartAgentRequest {
     pub parent_run_id: Option<String>,
 }
 
-/// Tracks a single in-flight StartAgent action. At most one can be pending at
-/// a time because StartAgent actions execute serially (RunningActionPhase::Serial).
+/// Tracks a single in-flight StartAgent action.
 struct PendingStartAgent {
     parent_conversation_id: AIConversationId,
-    /// Set when `StartedNewConversation` fires for a conversation whose
-    /// `parent_conversation_id` matches.
+    /// Set when the terminal pane finishes synchronously creating the
+    /// child conversation (via
+    /// [`StartAgentExecutor::record_child_conversation`]). Until that
+    /// happens, this stays `None` so history events targeting the child
+    /// can be ignored for this pending.
     child_conversation_id: Option<AIConversationId>,
     sender: async_channel::Sender<StartAgentDecision>,
 }
 
 pub struct StartAgentExecutor {
-    /// The currently pending StartAgent action, if any.
-    pending: Option<PendingStartAgent>,
+    /// In-flight StartAgent requests keyed by their executor-minted id.
+    /// Multiple entries can be live concurrently when callers fan out
+    /// (orchestrate Accept). Dropped synchronously when the request reaches
+    /// a terminal `StartAgentDecision`.
+    pending: HashMap<StartAgentRequestId, PendingStartAgent>,
+    next_request_id: u64,
 }
 
 impl StartAgentExecutor {
@@ -63,7 +99,48 @@ impl StartAgentExecutor {
         let history_model = BlocklistAIHistoryModel::handle(ctx);
         ctx.subscribe_to_model(&history_model, Self::handle_history_event);
 
-        Self { pending: None }
+        Self {
+            pending: HashMap::new(),
+            next_request_id: 0,
+        }
+    }
+
+    /// Returns the next monotonic request id, advancing the internal
+    /// counter. Wraps on overflow (practically unreachable; reuse is
+    /// harmless because the counter overflows long after every prior
+    /// pending has resolved).
+    fn next_request_id(&mut self) -> StartAgentRequestId {
+        let id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        StartAgentRequestId(id)
+    }
+
+    /// Records the synchronously-created child conversation id for a
+    /// pending request. Called by the terminal pane immediately after
+    /// `start_new_child_conversation` returns; subsequent
+    /// `ConversationServerTokenAssigned` / `UpdatedConversationStatus`
+    /// history events use this id to find the matching pending.
+    pub fn record_child_conversation(
+        &mut self,
+        request_id: StartAgentRequestId,
+        child_conversation_id: AIConversationId,
+    ) {
+        if let Some(pending) = self.pending.get_mut(&request_id) {
+            pending.child_conversation_id = Some(child_conversation_id);
+        }
+    }
+
+    /// Finds the pending request id whose recorded
+    /// `child_conversation_id` matches the supplied id, if any. Returns
+    /// the `StartAgentRequestId` so the caller can `pending.remove(&id)`
+    /// and consume the entry by value.
+    fn find_pending_by_child(
+        &self,
+        child_conversation_id: &AIConversationId,
+    ) -> Option<StartAgentRequestId> {
+        self.pending.iter().find_map(|(id, pending)| {
+            (pending.child_conversation_id.as_ref() == Some(child_conversation_id)).then_some(*id)
+        })
     }
 
     fn handle_history_event(
@@ -72,35 +149,14 @@ impl StartAgentExecutor {
         ctx: &mut ModelContext<Self>,
     ) {
         match event {
-            BlocklistAIHistoryEvent::StartedNewConversation {
-                new_conversation_id,
-                ..
-            } => {
-                let Some(pending) = self.pending.as_mut() else {
-                    return;
-                };
-                if pending.child_conversation_id.is_some() {
-                    return;
-                }
-                let history = BlocklistAIHistoryModel::as_ref(ctx);
-                let Some(conversation) = history.conversation(new_conversation_id) else {
-                    return;
-                };
-                if conversation.parent_conversation_id() == Some(pending.parent_conversation_id) {
-                    pending.child_conversation_id = Some(*new_conversation_id);
-                }
-            }
             BlocklistAIHistoryEvent::ConversationServerTokenAssigned {
                 conversation_id, ..
             } => {
-                let matches = self
-                    .pending
-                    .as_ref()
-                    .is_some_and(|p| p.child_conversation_id.as_ref() == Some(conversation_id));
-                if !matches {
+                let Some(request_id) = self.find_pending_by_child(conversation_id) else {
                     return;
-                }
-                let pending = self.pending.take().unwrap();
+                };
+                // Safe to unwrap: `find_pending_by_child` returned the id.
+                let pending = self.pending.remove(&request_id).unwrap();
                 let agent_id = BlocklistAIHistoryModel::as_ref(ctx)
                     .conversation(conversation_id)
                     .and_then(|c| c.orchestration_agent_id());
@@ -147,13 +203,9 @@ impl StartAgentExecutor {
             BlocklistAIHistoryEvent::UpdatedConversationStatus {
                 conversation_id, ..
             } => {
-                let matches = self
-                    .pending
-                    .as_ref()
-                    .is_some_and(|p| p.child_conversation_id.as_ref() == Some(conversation_id));
-                if !matches {
+                let Some(request_id) = self.find_pending_by_child(conversation_id) else {
                     return;
-                }
+                };
                 let history = BlocklistAIHistoryModel::as_ref(ctx);
                 let Some(conversation) = history.conversation(conversation_id) else {
                     return;
@@ -163,7 +215,7 @@ impl StartAgentExecutor {
                     conversation.status_error_message(),
                 );
                 if let Some(error_msg) = error_msg {
-                    let pending = self.pending.take().unwrap();
+                    let pending = self.pending.remove(&request_id).unwrap();
                     let _ = pending
                         .sender
                         .try_send(StartAgentDecision::Error(error_msg.clone()));
@@ -179,7 +231,8 @@ impl StartAgentExecutor {
                     }
                 }
             }
-            BlocklistAIHistoryEvent::CreatedSubtask { .. }
+            BlocklistAIHistoryEvent::StartedNewConversation { .. }
+            | BlocklistAIHistoryEvent::CreatedSubtask { .. }
             | BlocklistAIHistoryEvent::UpgradedTask { .. }
             | BlocklistAIHistoryEvent::AppendedExchange { .. }
             | BlocklistAIHistoryEvent::ReassignedExchange { .. }
@@ -357,13 +410,18 @@ impl StartAgentExecutor {
         };
 
         let (sender, receiver) = async_channel::bounded(1);
-        self.pending = Some(PendingStartAgent {
-            parent_conversation_id,
-            child_conversation_id: None,
-            sender,
-        });
+        let request_id = self.next_request_id();
+        self.pending.insert(
+            request_id,
+            PendingStartAgent {
+                parent_conversation_id,
+                child_conversation_id: None,
+                sender,
+            },
+        );
 
         ctx.emit(StartAgentExecutorEvent::CreateAgent(StartAgentRequest {
+            id: request_id,
             name: name.clone(),
             prompt,
             execution_mode,

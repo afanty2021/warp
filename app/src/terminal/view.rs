@@ -1975,8 +1975,15 @@ pub enum Event {
     },
     FreeTierLimitCheckTriggered,
     /// Emitted when the StartAgent executor needs the workspace to create a new child
-    /// agent conversation in a split pane.
-    StartAgentConversation(StartAgentRequest),
+    /// agent conversation in a split pane. The executor handle is plumbed through
+    /// alongside the request so the workspace can echo the synchronously-created
+    /// child conversation id back via
+    /// [`StartAgentExecutor::record_child_conversation`], disambiguating per-request
+    /// pendings when multiple StartAgent requests are in flight in parallel.
+    StartAgentConversation {
+        request: StartAgentRequest,
+        executor: ModelHandle<StartAgentExecutor>,
+    },
     /// Emitted when the user clicks a child agent row in the status card to reveal
     /// its hidden pane.
     RevealChildAgent {
@@ -6379,13 +6386,16 @@ impl TerminalView {
 
     fn handle_start_agent_executor_event(
         &mut self,
-        _: ModelHandle<StartAgentExecutor>,
+        executor: ModelHandle<StartAgentExecutor>,
         event: &StartAgentExecutorEvent,
         ctx: &mut ViewContext<Self>,
     ) {
         match event {
             StartAgentExecutorEvent::CreateAgent(request) => {
-                ctx.emit(Event::StartAgentConversation(request.clone()));
+                ctx.emit(Event::StartAgentConversation {
+                    request: request.clone(),
+                    executor: executor.clone(),
+                });
             }
         }
     }

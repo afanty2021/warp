@@ -9,6 +9,12 @@ use crate::ai::blocklist::BlocklistAIHistoryModel;
 use ai::agent::action_result::StartAgentVersion;
 use warp_core::features::FeatureFlag;
 use warpui::{App, EntityId};
+
+/// First request id minted by a freshly-constructed `StartAgentExecutor`.
+/// Tests rely on this monotonic ordering when calling
+/// `record_child_conversation` to mimic the reservation flow normally
+/// driven by `terminal_pane.rs`.
+const FIRST_REQUEST_ID: StartAgentRequestId = StartAgentRequestId::from_raw_for_test(0);
 fn build_start_agent_action(
     version: StartAgentVersion,
     execution_mode: StartAgentExecutionMode,
@@ -68,12 +74,20 @@ fn execute_returns_error_when_child_startup_is_blocked_before_initialization() {
             )
         });
 
+        // Mimic the reservation flow that the terminal pane normally drives:
+        // record the freshly-created child conversation id back on the
+        // executor's pending request so subsequent history events can
+        // disambiguate per-request side effects.
+        executor.update(&mut app, |executor, _| {
+            executor.record_child_conversation(FIRST_REQUEST_ID, child_conversation_id);
+        });
+
         executor.read(&app, |executor, _| {
             assert_eq!(
                 executor
                     .pending
-                    .as_ref()
-                    .and_then(|pending| pending.child_conversation_id),
+                    .values()
+                    .find_map(|pending| pending.child_conversation_id),
                 Some(child_conversation_id)
             );
         });
@@ -102,7 +116,7 @@ fn execute_returns_error_when_child_startup_is_blocked_before_initialization() {
         ));
 
         executor.read(&app, |executor, _| {
-            assert!(executor.pending.is_none());
+            assert!(executor.pending.is_empty());
         });
     });
 }
@@ -146,6 +160,11 @@ fn execute_returns_detailed_error_when_child_startup_fails_before_initialization
                 parent_conversation_id,
                 ctx,
             )
+        });
+
+        // Reservation echo — see the matching call in the previous test.
+        executor.update(&mut app, |executor, _| {
+            executor.record_child_conversation(FIRST_REQUEST_ID, child_conversation_id);
         });
 
         history_model.update(&mut app, |history_model, ctx| {
@@ -277,6 +296,186 @@ fn execute_returns_error_when_local_harness_child_missing_parent_run_id() {
                     == "Local harness child agents require the parent run_id to be available."
                     && version == StartAgentVersion::V2
         ));
+    });
+}
+
+/// Asserts that two parallel `execute()` calls populate the executor's
+/// pending HashMap with two distinct entries, each disambiguated by their
+/// freshly-minted `StartAgentRequestId`. This is the happy-path baseline
+/// for the orchestrate Accept fan-out that issues N concurrent
+/// StartAgents under the same `parent_conversation_id`.
+#[test]
+fn parallel_dispatch_keeps_two_pendings_distinguishable_by_request_id() {
+    App::test((), |mut app| async move {
+        let _orchestration_v2 = FeatureFlag::OrchestrationV2.override_enabled(true);
+        let terminal_view_id = EntityId::new();
+        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new_for_test());
+        let executor = app.add_model(StartAgentExecutor::new);
+        let parent_conversation_id = history_model.update(&mut app, |history_model, ctx| {
+            history_model.start_new_conversation(terminal_view_id, false, false, ctx)
+        });
+
+        // Issue two execute() calls back-to-back; each should mint a fresh
+        // request id (0 then 1) and insert a fresh pending into the executor.
+        let action_a = build_start_agent_action(
+            StartAgentVersion::V1,
+            StartAgentExecutionMode::local_with_defaults(),
+        );
+        let action_b = build_start_agent_action(
+            StartAgentVersion::V1,
+            StartAgentExecutionMode::local_with_defaults(),
+        );
+        executor.update(&mut app, |executor, ctx| {
+            let _: AnyActionExecution = executor
+                .execute(
+                    ExecuteActionInput {
+                        action: &action_a,
+                        conversation_id: parent_conversation_id,
+                    },
+                    ctx,
+                )
+                .into();
+            let _: AnyActionExecution = executor
+                .execute(
+                    ExecuteActionInput {
+                        action: &action_b,
+                        conversation_id: parent_conversation_id,
+                    },
+                    ctx,
+                )
+                .into();
+        });
+
+        executor.read(&app, |executor, _| {
+            assert_eq!(executor.pending.len(), 2, "both pendings should be live");
+            assert!(executor.pending.contains_key(&FIRST_REQUEST_ID));
+            assert!(executor
+                .pending
+                .contains_key(&StartAgentRequestId::from_raw_for_test(1)));
+        });
+    });
+}
+
+/// Asserts that the executor's `find_pending_by_child` lookup correctly
+/// disambiguates which of two parallel pendings is targeted by an
+/// incoming `UpdatedConversationStatus` history event. Without the
+/// reservation flow, both pendings would share the same
+/// `parent_conversation_id` and the first-match heuristic would have
+/// picked an arbitrary one.
+#[test]
+fn parallel_pendings_each_resolve_independently_via_recorded_child_id() {
+    App::test((), |mut app| async move {
+        let _orchestration_v2 = FeatureFlag::OrchestrationV2.override_enabled(true);
+        let terminal_view_id = EntityId::new();
+        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new_for_test());
+        let executor = app.add_model(StartAgentExecutor::new);
+        let parent_conversation_id = history_model.update(&mut app, |history_model, ctx| {
+            history_model.start_new_conversation(terminal_view_id, false, false, ctx)
+        });
+
+        let action_a = build_start_agent_action(
+            StartAgentVersion::V1,
+            StartAgentExecutionMode::local_with_defaults(),
+        );
+        let action_b = build_start_agent_action(
+            StartAgentVersion::V1,
+            StartAgentExecutionMode::local_with_defaults(),
+        );
+        let exec_a = executor.update(&mut app, |executor, ctx| {
+            let result: AnyActionExecution = executor
+                .execute(
+                    ExecuteActionInput {
+                        action: &action_a,
+                        conversation_id: parent_conversation_id,
+                    },
+                    ctx,
+                )
+                .into();
+            result
+        });
+        let exec_b = executor.update(&mut app, |executor, ctx| {
+            let result: AnyActionExecution = executor
+                .execute(
+                    ExecuteActionInput {
+                        action: &action_b,
+                        conversation_id: parent_conversation_id,
+                    },
+                    ctx,
+                )
+                .into();
+            result
+        });
+        let (
+            AnyActionExecution::Async {
+                execute_future: future_a,
+                on_complete: complete_a,
+            },
+            AnyActionExecution::Async {
+                execute_future: future_b,
+                on_complete: complete_b,
+            },
+        ) = (exec_a, exec_b)
+        else {
+            panic!("expected async executions");
+        };
+
+        // Two distinct child conversations under the same parent, mimicking
+        // the orchestrate Accept fan-out.
+        let child_a = history_model.update(&mut app, |history_model, ctx| {
+            history_model.start_new_child_conversation(
+                terminal_view_id,
+                "Agent A".to_string(),
+                parent_conversation_id,
+                ctx,
+            )
+        });
+        let child_b = history_model.update(&mut app, |history_model, ctx| {
+            history_model.start_new_child_conversation(
+                terminal_view_id,
+                "Agent B".to_string(),
+                parent_conversation_id,
+                ctx,
+            )
+        });
+
+        executor.update(&mut app, |executor, _| {
+            executor.record_child_conversation(FIRST_REQUEST_ID, child_a);
+            executor.record_child_conversation(StartAgentRequestId::from_raw_for_test(1), child_b);
+        });
+
+        // Fail child_b only; child_a's pending must be untouched.
+        history_model.update(&mut app, |history_model, ctx| {
+            history_model.update_conversation_status_with_error_message(
+                terminal_view_id,
+                child_b,
+                ConversationStatus::Error,
+                Some("Agent B init failed".to_string()),
+                ctx,
+            );
+        });
+
+        // child_b's future resolves with the failure error...
+        let async_b = future_b.await;
+        let result_b = app.update(|ctx| complete_b(async_b, ctx));
+        assert!(matches!(
+            result_b,
+            AIAgentActionResultType::StartAgent(StartAgentResult::Error { error, .. })
+                if error == "Agent B init failed"
+        ));
+
+        // ...while child_a's pending is still alive in the executor's table.
+        executor.read(&app, |executor, _| {
+            assert_eq!(
+                executor.pending.len(),
+                1,
+                "only child_b's pending should have been removed"
+            );
+            assert!(executor.pending.contains_key(&FIRST_REQUEST_ID));
+        });
+
+        // Drop the still-pending future to avoid hanging the test.
+        drop(future_a);
+        drop(complete_a);
     });
 }
 
