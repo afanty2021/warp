@@ -5,7 +5,6 @@ pub mod block;
 pub mod code_block;
 mod context_model;
 mod controller;
-pub(crate) mod orchestrate_dispatch;
 pub(crate) mod orchestration_event_streamer;
 pub(crate) mod orchestration_events;
 mod passive_suggestions;
@@ -28,16 +27,12 @@ pub(crate) mod codebase_index_speedbump_banner;
 pub(crate) mod telemetry_banner;
 pub(super) mod view_util;
 
-// `StartAgentRequestId` is currently only consumed by the AIBlock orchestrate
-// fan-out (still in the same PR). Until that lands, allow the re-export to
-// be unused to keep the executor tests compiling without warnings.
 #[cfg_attr(target_family = "wasm", allow(unused_imports))]
-#[allow(unused_imports)]
 pub(crate) use action_model::{
     apply_edits, read_local_file_context, BlocklistAIActionEvent, BlocklistAIActionModel,
     FileReadResult, ReadFileContextResult, RequestFileEditsFormatKind, ShellCommandExecutor,
-    ShellCommandExecutorEvent, StartAgentExecutor, StartAgentExecutorEvent, StartAgentRequest,
-    StartAgentRequestId,
+    ShellCommandExecutorEvent, StartAgentExecutor, StartAgentExecutorEvent, StartAgentOutcome,
+    StartAgentRequest,
 };
 
 #[cfg(any(test, feature = "integration_tests"))]

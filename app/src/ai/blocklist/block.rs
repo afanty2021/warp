@@ -99,7 +99,6 @@ use crate::cloud_object::model::generic_string_model::GenericStringObjectId;
 use crate::cloud_object::model::persistence::CloudModel;
 use crate::code_review::telemetry_event::CodeReviewPaneEntrypoint;
 use crate::server::ids::SyncId;
-use crate::server::server_api::ServerApiProvider;
 use crate::server::telemetry::AgentModeRewindEntrypoint;
 use crate::settings::InputSettings;
 use crate::terminal::view::{CodeDiffAction, TerminalAction};
@@ -185,7 +184,12 @@ use crate::workspace::{ForkAIConversationParams, ForkedConversationDestination, 
 use crate::{report_error, report_if_error, ToastStack};
 use ai::agent::action::{AskUserQuestionItem, InsertReviewComment};
 use ai::agent::action::{OrchestrateAgentRunConfig, OrchestrateExecutionMode, OrchestrateRequest};
+use ai::agent::action_result::{
+    OrchestrateAgentOutcome, OrchestrateAgentOutcomeKind, OrchestrateLaunchedExecutionMode,
+};
 use warp_cli::agent::Harness;
+
+use crate::ai::blocklist::StartAgentOutcome;
 
 use crate::ai::agent_conversations_model::AgentConversationsModel;
 use crate::ai::execution_profiles::model_menu_items::available_model_menu_items;
@@ -7004,36 +7008,233 @@ impl AIBlock {
             .map(|state| state.to_request())
             .unwrap_or(live_request);
 
-        // Capture the parent run_id (if any) so child agents link back to
-        // their orchestrator. Mirrors `start_agent::execute` which sources
-        // this from `BlocklistAIHistoryModel`.
+        if request.agent_run_configs.is_empty() {
+            log::warn!("OrchestrateAccept: empty agent_run_configs; surfacing failure result");
+            self.apply_orchestrate_action_result(
+                action_id,
+                task_id,
+                ai::agent::action_result::OrchestrateResult::Failure {
+                    error: "orchestrate: empty agent_run_configs".to_string(),
+                },
+                ctx,
+            );
+            return;
+        }
+
+        // Snapshot the run-wide config and per-agent configs we'll need
+        // both inside the dispatch loop and again when assembling the
+        // final `OrchestrateResult::Launched` (where we report outcomes
+        // in input order).
+        let parent_conversation_id = self.client_ids.conversation_id;
         let parent_run_id = BlocklistAIHistoryModel::as_ref(ctx)
-            .conversation(&self.client_ids.conversation_id)
+            .conversation(&parent_conversation_id)
             .and_then(|c| c.run_id());
+        let run_model_id = request.model_id.clone();
+        let run_harness_type = request.harness_type.clone();
+        let run_execution_mode = request.execution_mode.clone();
+        let agent_run_configs = request.agent_run_configs.clone();
+        let base_prompt = request.base_prompt.clone();
 
-        let ai_client = ServerApiProvider::as_ref(ctx).get_ai_client();
-        let conversation_id = self.client_ids.conversation_id;
+        let executor_handle = self.action_model.as_ref(ctx).start_agent_executor(ctx);
+
+        // Pre-resolve each child's `StartAgentExecutionMode`, then dispatch
+        // through the executor in input order. Pre-flight failures (Remote
+        // missing parent_run_id, OpenCode + Remote, etc.) collapse to a
+        // synchronous `Failed` outcome for that child without ever hitting
+        // the executor; the rest produce a receiver we await later.
+        enum ChildSlot {
+            Failed(String),
+            Pending(async_channel::Receiver<StartAgentOutcome>),
+        }
+
+        let mut slots: Vec<ChildSlot> = Vec::with_capacity(agent_run_configs.len());
+        for cfg in &agent_run_configs {
+            let prompt = compose_orchestrate_child_prompt(&base_prompt, &cfg.prompt);
+            let mode = orchestrate_to_start_agent_mode(
+                &run_execution_mode,
+                &run_harness_type,
+                &run_model_id,
+                cfg,
+            );
+            let mode = match mode {
+                Ok(mode) => mode,
+                Err(error) => {
+                    slots.push(ChildSlot::Failed(error));
+                    continue;
+                }
+            };
+            // OrchestrateExecutionMode::Remote requires `parent_run_id`;
+            // surface a child-level failure rather than aborting the
+            // whole batch when it's missing.
+            if matches!(run_execution_mode, OrchestrateExecutionMode::Remote { .. })
+                && parent_run_id.is_none()
+            {
+                slots.push(ChildSlot::Failed(
+                    "Remote child agents require the parent run_id to be available.".to_string(),
+                ));
+                continue;
+            }
+            let receiver = executor_handle.update(ctx, |executor, model_ctx| {
+                executor.dispatch(
+                    cfg.name.clone(),
+                    prompt,
+                    mode,
+                    None, /* lifecycle_subscription */
+                    parent_conversation_id,
+                    parent_run_id.clone(),
+                    model_ctx,
+                )
+            });
+            slots.push(ChildSlot::Pending(receiver));
+        }
+
         let action_id_for_result = action_id.clone();
-
-        let dispatch_inputs = crate::ai::blocklist::orchestrate_dispatch::DispatchInputs {
-            request,
-            client: ai_client,
-            parent_run_id,
-        };
-
+        let agent_run_configs_for_result = agent_run_configs.clone();
         ctx.spawn(
-            crate::ai::blocklist::orchestrate_dispatch::dispatch_orchestrate(dispatch_inputs),
-            move |me, result, ctx| {
-                let action_result = AIAgentActionResult {
-                    id: action_id_for_result.clone(),
-                    task_id,
-                    result: AIAgentActionResultType::Orchestrate(result),
+            async move {
+                let mut outcomes: Vec<OrchestrateAgentOutcomeKind> =
+                    Vec::with_capacity(slots.len());
+                for slot in slots {
+                    let kind = match slot {
+                        ChildSlot::Failed(error) => OrchestrateAgentOutcomeKind::Failed { error },
+                        ChildSlot::Pending(receiver) => match receiver.recv().await {
+                            Ok(StartAgentOutcome::Started { agent_id }) => {
+                                OrchestrateAgentOutcomeKind::Launched { agent_id }
+                            }
+                            Ok(StartAgentOutcome::Error(error)) => {
+                                OrchestrateAgentOutcomeKind::Failed { error }
+                            }
+                            Err(_) => OrchestrateAgentOutcomeKind::Failed {
+                                error: "Cancelled before launch".to_string(),
+                            },
+                        },
+                    };
+                    outcomes.push(kind);
+                }
+                outcomes
+            },
+            move |me, outcomes, ctx| {
+                let agents = agent_run_configs_for_result
+                    .iter()
+                    .zip(outcomes)
+                    .map(|(cfg, kind)| OrchestrateAgentOutcome {
+                        name: cfg.name.clone(),
+                        title: cfg.title.clone(),
+                        kind,
+                    })
+                    .collect();
+                let launched_mode = match &run_execution_mode {
+                    OrchestrateExecutionMode::Local => OrchestrateLaunchedExecutionMode::Local,
+                    OrchestrateExecutionMode::Remote {
+                        environment_id,
+                        worker_host,
+                        computer_use_enabled,
+                    } => OrchestrateLaunchedExecutionMode::Remote {
+                        environment_id: environment_id.clone(),
+                        worker_host: worker_host.clone(),
+                        computer_use_enabled: *computer_use_enabled,
+                    },
                 };
-                me.action_model.update(ctx, |action_model, ctx| {
-                    action_model.apply_finished_action_result(conversation_id, action_result, ctx);
-                });
+                let result = ai::agent::action_result::OrchestrateResult::Launched {
+                    model_id: run_model_id,
+                    harness_type: run_harness_type,
+                    execution_mode: launched_mode,
+                    agents,
+                };
+                me.apply_orchestrate_action_result(&action_id_for_result, task_id, result, ctx);
             },
         );
+    }
+
+    /// Helper to apply a terminal `OrchestrateResult` to the action model
+    /// so the action is removed from the pending queue and the result is
+    /// mirrored back to the agent on the next request.
+    fn apply_orchestrate_action_result(
+        &mut self,
+        action_id: &AIAgentActionId,
+        task_id: crate::ai::agent::task::TaskId,
+        result: ai::agent::action_result::OrchestrateResult,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let conversation_id = self.client_ids.conversation_id;
+        let action_result = AIAgentActionResult {
+            id: action_id.clone(),
+            task_id,
+            result: AIAgentActionResultType::Orchestrate(result),
+        };
+        self.action_model.update(ctx, |action_model, ctx| {
+            action_model.apply_finished_action_result(conversation_id, action_result, ctx);
+        });
+    }
+}
+
+/// Compose the per-child prompt per spec invariant:
+/// `base_prompt + "\n\n" + agent_run_configs[i].prompt` when both are
+/// non-empty, just `base_prompt` when the per-agent `prompt` is empty,
+/// and just the per-agent `prompt` when `base_prompt` is empty
+/// (defensive).
+fn compose_orchestrate_child_prompt(base_prompt: &str, per_agent_prompt: &str) -> String {
+    let base_trimmed = base_prompt.trim();
+    let per_agent_trimmed = per_agent_prompt.trim();
+    match (base_trimmed.is_empty(), per_agent_trimmed.is_empty()) {
+        (false, false) => format!("{base_prompt}\n\n{per_agent_prompt}"),
+        (false, true) => base_prompt.to_string(),
+        (true, false) => per_agent_prompt.to_string(),
+        (true, true) => String::new(),
+    }
+}
+
+/// Translate a single `(orchestrate_execution_mode, harness_type,
+/// model_id, per-agent config)` tuple into the `StartAgentExecutionMode`
+/// the StartAgent executor expects.
+///
+/// Returns `Err(reason)` if the combination is rejected pre-flight (e.g.
+/// OpenCode+Remote or an unrecognised local harness); the caller surfaces
+/// the reason as a per-child `Failed` outcome.
+fn orchestrate_to_start_agent_mode(
+    run_execution_mode: &OrchestrateExecutionMode,
+    run_harness_type: &str,
+    run_model_id: &str,
+    cfg: &OrchestrateAgentRunConfig,
+) -> Result<crate::ai::agent::StartAgentExecutionMode, String> {
+    use crate::ai::agent::StartAgentExecutionMode as M;
+    match run_execution_mode {
+        OrchestrateExecutionMode::Local => {
+            // Empty/oz harness uses the legacy local Oz path
+            // (`harness_type: None`). Other harnesses route through the
+            // Local-with-harness arm.
+            let trimmed = run_harness_type.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("oz") {
+                Ok(M::Local { harness_type: None })
+            } else {
+                Ok(M::Local {
+                    harness_type: Some(trimmed.to_string()),
+                })
+            }
+        }
+        OrchestrateExecutionMode::Remote {
+            environment_id,
+            worker_host,
+            computer_use_enabled,
+        } => {
+            // OpenCode is unsupported on Remote per `start_agent::execute`;
+            // surface as a child-level failure so other children can still
+            // launch.
+            if run_harness_type.eq_ignore_ascii_case("opencode") {
+                return Err(
+                    "Remote child agents do not support the opencode harness yet.".to_string(),
+                );
+            }
+            Ok(M::Remote {
+                environment_id: environment_id.clone(),
+                skill_references: Vec::new(),
+                model_id: run_model_id.to_string(),
+                computer_use_enabled: *computer_use_enabled,
+                worker_host: worker_host.clone(),
+                harness_type: run_harness_type.to_string(),
+                title: cfg.title.clone(),
+            })
+        }
     }
 }
 

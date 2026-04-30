@@ -16,9 +16,20 @@ use warp_core::features::FeatureFlag;
 
 use super::{ActionExecution, AnyActionExecution, ExecuteActionInput, PreprocessActionInput};
 
-/// The result sent back to the executor after observing the child agent's lifecycle.
-enum StartAgentDecision {
-    /// The child conversation was created successfully.
+/// Outcome the executor surfaces back to a caller awaiting a single
+/// StartAgent request. Internal to this module historically; made `pub` so
+/// the orchestrate Accept fan-out (which dispatches N requests in
+/// parallel and `join_all`s their receivers) can reason about the result
+/// for each child without going through the action-model `on_complete`
+/// machinery.
+///
+/// `Cancelled` is reserved for callers; the existing `execute()` path
+/// continues to map a dropped receiver to
+/// [`StartAgentResult::Cancelled`] via its `on_complete` closure.
+#[derive(Debug, Clone)]
+pub enum StartAgentOutcome {
+    /// The child conversation was created successfully and the server
+    /// assigned an orchestration agent id.
     Started { agent_id: String },
     /// An error occurred while starting the agent.
     Error(String),
@@ -82,7 +93,7 @@ struct PendingStartAgent {
     /// happens, this stays `None` so history events targeting the child
     /// can be ignored for this pending.
     child_conversation_id: Option<AIConversationId>,
-    sender: async_channel::Sender<StartAgentDecision>,
+    sender: async_channel::Sender<StartAgentOutcome>,
 }
 
 pub struct StartAgentExecutor {
@@ -162,7 +173,7 @@ impl StartAgentExecutor {
                     .and_then(|c| c.orchestration_agent_id());
                 match agent_id {
                     Some(id) => {
-                        let _ = pending.sender.try_send(StartAgentDecision::Started {
+                        let _ = pending.sender.try_send(StartAgentOutcome::Started {
                             agent_id: id.clone(),
                         });
                         if FeatureFlag::OrchestrationV2.is_enabled() {
@@ -184,7 +195,7 @@ impl StartAgentExecutor {
                             "ConversationServerTokenAssigned fired but no agent identifier for \
                              {conversation_id:?}"
                         );
-                        let _ = pending.sender.try_send(StartAgentDecision::Error(
+                        let _ = pending.sender.try_send(StartAgentOutcome::Error(
                             "Server did not assign an agent identifier".to_string(),
                         ));
                         if !FeatureFlag::OrchestrationV2.is_enabled() {
@@ -218,7 +229,7 @@ impl StartAgentExecutor {
                     let pending = self.pending.remove(&request_id).unwrap();
                     let _ = pending
                         .sender
-                        .try_send(StartAgentDecision::Error(error_msg.clone()));
+                        .try_send(StartAgentOutcome::Error(error_msg.clone()));
                     if !FeatureFlag::OrchestrationV2.is_enabled() {
                         OrchestrationEventService::handle(ctx).update(ctx, |svc, ctx| {
                             svc.emit_child_startup_errored(
@@ -432,13 +443,13 @@ impl StartAgentExecutor {
 
         ActionExecution::new_async(async move { receiver.recv().await }, move |result, _ctx| {
             match result {
-                Ok(StartAgentDecision::Started { agent_id }) => {
+                Ok(StartAgentOutcome::Started { agent_id }) => {
                     AIAgentActionResultType::StartAgent(StartAgentResult::Success {
                         agent_id,
                         version,
                     })
                 }
-                Ok(StartAgentDecision::Error(error)) => {
+                Ok(StartAgentOutcome::Error(error)) => {
                     AIAgentActionResultType::StartAgent(StartAgentResult::Error { error, version })
                 }
                 Err(_) => {
@@ -446,6 +457,51 @@ impl StartAgentExecutor {
                 }
             }
         })
+    }
+
+    /// Public dispatch entrypoint for callers that already have a fully-built
+    /// `StartAgentExecutionMode` and have done their own validation (e.g.
+    /// the orchestrate Accept fan-out, which validates the user-edited
+    /// configuration in the confirmation card before reaching the
+    /// executor).
+    ///
+    /// Mints a fresh [`StartAgentRequestId`], inserts a pending entry
+    /// keyed by it, emits [`StartAgentExecutorEvent::CreateAgent`] so the
+    /// pane group can stand up the child pane, and returns the receiver
+    /// the caller awaits to learn the per-request [`StartAgentOutcome`].
+    /// The history-event handler completes the receiver (Started / Error)
+    /// via the same reservation flow used by [`Self::execute`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch(
+        &mut self,
+        name: String,
+        prompt: String,
+        execution_mode: StartAgentExecutionMode,
+        lifecycle_subscription: Option<Vec<LifecycleEventType>>,
+        parent_conversation_id: AIConversationId,
+        parent_run_id: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) -> async_channel::Receiver<StartAgentOutcome> {
+        let (sender, receiver) = async_channel::bounded(1);
+        let request_id = self.next_request_id();
+        self.pending.insert(
+            request_id,
+            PendingStartAgent {
+                parent_conversation_id,
+                child_conversation_id: None,
+                sender,
+            },
+        );
+        ctx.emit(StartAgentExecutorEvent::CreateAgent(StartAgentRequest {
+            id: request_id,
+            name,
+            prompt,
+            execution_mode,
+            lifecycle_subscription,
+            parent_conversation_id,
+            parent_run_id,
+        }));
+        receiver
     }
 
     pub(super) fn preprocess_action(
