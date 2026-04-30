@@ -185,6 +185,14 @@ use crate::workspace::{ForkAIConversationParams, ForkedConversationDestination, 
 use crate::{report_error, report_if_error, ToastStack};
 use ai::agent::action::{AskUserQuestionItem, InsertReviewComment};
 use ai::agent::action::{OrchestrateAgentRunConfig, OrchestrateExecutionMode, OrchestrateRequest};
+use warp_cli::agent::Harness;
+
+use crate::ai::agent_conversations_model::AgentConversationsModel;
+use crate::ai::execution_profiles::model_menu_items::available_model_menu_items;
+use crate::ai::harness_display;
+use crate::menu::{MenuItem, MenuItemFields};
+use crate::view_components::dropdown::{Dropdown, DropdownAction, DropdownStyle};
+use crate::view_components::FilterableDropdown;
 
 use crate::editor::InteractionState;
 use crate::server::telemetry::{AutonomySettingToggleSource, InteractionSource};
@@ -419,7 +427,9 @@ impl OrchestrateEditState {
             OrchestrateExecutionMode::Remote { .. }
                 if self.harness_type.eq_ignore_ascii_case("opencode") =>
             {
-                Some("OpenCode is not supported on Cloud yet. Switch to Local or pick a different harness.")
+                Some(
+                    "OpenCode is not supported on Cloud yet. Switch to Local or pick a different harness.",
+                )
             }
             _ => None,
         }
@@ -439,13 +449,15 @@ impl OrchestrateEditState {
     }
 }
 
-/// `MouseStateHandle`s for the per-action Reject/Edit/Accept buttons + the
-/// per-action Local/Cloud toggle and picker rows used inside the inline
-/// editor. Per-picker `Dropdown` views are intentionally NOT stored here;
-/// the picker integration uses simpler `MouseStateHandle`-driven cycle
-/// buttons (TODO(QUALITY-569 fast-follow): swap in real `Dropdown` views
-/// once the model/harness/environment list rendering is consolidated
-/// behind a reusable component).
+/// Per-action UI handles for the `orchestrate` confirmation card.
+///
+/// Holds `MouseStateHandle`s for the Reject/Edit/Accept buttons + the
+/// Local/Cloud toggle, plus the lazily-created picker `ViewHandle`s for
+/// the inline editor (model/harness `Dropdown`s and a filterable env
+/// `FilterableDropdown`). Picker handles are `Option<...>` because they
+/// are constructed on-demand the first time the user opens the editor;
+/// reusing the same handles across re-renders keeps the dropdowns'
+/// internal selection/focus state stable.
 #[derive(Default, Clone)]
 pub(super) struct OrchestrateCardHandles {
     pub(super) reject_button: MouseStateHandle,
@@ -453,9 +465,9 @@ pub(super) struct OrchestrateCardHandles {
     pub(super) accept_button: MouseStateHandle,
     pub(super) local_toggle: MouseStateHandle,
     pub(super) cloud_toggle: MouseStateHandle,
-    pub(super) model_picker: MouseStateHandle,
-    pub(super) harness_picker: MouseStateHandle,
-    pub(super) environment_picker: MouseStateHandle,
+    pub(super) model_picker: Option<ViewHandle<Dropdown<AIBlockAction>>>,
+    pub(super) harness_picker: Option<ViewHandle<Dropdown<AIBlockAction>>>,
+    pub(super) environment_picker: Option<ViewHandle<FilterableDropdown<AIBlockAction>>>,
 }
 
 /// Like `SecondaryTheme` but with grey text instead of white.
@@ -6568,6 +6580,10 @@ impl TypedActionView for AIBlock {
                 if let Some(state) = self.orchestrate_edit_states.get_mut(action_id) {
                     state.toggle_execution_mode_to_remote(*is_remote);
                 }
+                // The Local→Cloud transition can programmatically reset
+                // OpenCode→Oz; keep the harness dropdown's display in sync
+                // with that change so the user sees the active harness.
+                self.sync_orchestrate_picker_selections(action_id, ctx);
             }
             AIBlockAction::OrchestrateModelChanged {
                 action_id,
@@ -6632,6 +6648,218 @@ impl AIBlock {
 
         if let Some(state) = self.orchestrate_edit_states.get_mut(action_id) {
             state.is_editor_open = !state.is_editor_open;
+        }
+
+        // Lazily build the model/harness/environment picker views the
+        // first time the editor is opened. Building them here (rather
+        // than at AIBlock construction) avoids spinning up dropdown
+        // entities for cards the user never edits, and keeps the
+        // picker views alive across editor toggles so their internal
+        // selection/focus state is preserved.
+        if self
+            .orchestrate_edit_states
+            .get(action_id)
+            .is_some_and(|s| s.is_editor_open)
+        {
+            self.ensure_orchestrate_pickers(action_id, ctx);
+        }
+    }
+
+    /// Lazily construct the model/harness/environment dropdown views for
+    /// an orchestrate confirmation card. Idempotent: re-running this with
+    /// already-populated handles is a no-op.
+    fn ensure_orchestrate_pickers(
+        &mut self,
+        action_id: &AIAgentActionId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(state) = self.orchestrate_edit_states.get(action_id).cloned() else {
+            return;
+        };
+
+        let existing = self.orchestrate_card_handles.get(action_id);
+        let needs_model = existing.is_none_or(|h| h.model_picker.is_none());
+        let needs_harness = existing.is_none_or(|h| h.harness_picker.is_none());
+        let needs_env = existing.is_none_or(|h| h.environment_picker.is_none());
+
+        let model_picker = if needs_model {
+            let action_id_for_picker = action_id.clone();
+            let initial_model_id = state.model_id.clone();
+            Some(ctx.add_typed_action_view(move |ctx_dropdown| {
+                let mut dropdown = Dropdown::<AIBlockAction>::new(ctx_dropdown);
+                dropdown.set_main_axis_size(MainAxisSize::Min, ctx_dropdown);
+                dropdown.set_menu_header_text_override(|t| format!("Model: {t}"));
+                dropdown.set_style(DropdownStyle::ActionButtonSecondary, ctx_dropdown);
+
+                let llm_prefs = LLMPreferences::as_ref(ctx_dropdown);
+                let choices: Vec<_> = llm_prefs.get_base_llm_choices_for_agent_mode().collect();
+                let initial_index = choices
+                    .iter()
+                    .position(|llm| llm.id.to_string() == initial_model_id);
+                let action_id_for_factory = action_id_for_picker.clone();
+                let items = available_model_menu_items(
+                    choices,
+                    move |llm| {
+                        DropdownAction::SelectActionAndClose(
+                            AIBlockAction::OrchestrateModelChanged {
+                                action_id: action_id_for_factory.clone(),
+                                model_id: llm.id.to_string(),
+                            },
+                        )
+                    },
+                    None,
+                    None,
+                    false,
+                    false,
+                    ctx_dropdown,
+                );
+                dropdown.set_rich_items(items, ctx_dropdown);
+                if let Some(idx) = initial_index {
+                    dropdown.set_selected_by_index(idx, ctx_dropdown);
+                }
+                dropdown
+            }))
+        } else {
+            None
+        };
+
+        let harness_picker = if needs_harness {
+            let action_id_for_picker = action_id.clone();
+            let initial_harness = state.harness_type.clone();
+            Some(ctx.add_typed_action_view(move |ctx_dropdown| {
+                let mut dropdown = Dropdown::<AIBlockAction>::new(ctx_dropdown);
+                dropdown.set_main_axis_size(MainAxisSize::Min, ctx_dropdown);
+                dropdown.set_menu_header_text_override(|t| format!("Harness: {t}"));
+                dropdown.set_style(DropdownStyle::ActionButtonSecondary, ctx_dropdown);
+
+                let mut items: Vec<MenuItem<DropdownAction<AIBlockAction>>> = Vec::new();
+                let mut selected_idx = None;
+                for (idx, harness) in [Harness::Oz, Harness::Claude, Harness::Gemini]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let mut fields = MenuItemFields::new(harness_display::display_name(harness))
+                        .with_icon(harness_display::icon_for(harness));
+                    if let Some(color) = harness_display::brand_color(harness) {
+                        fields = fields.with_override_icon_color(Fill::from(color));
+                    }
+                    let action_id_for_item = action_id_for_picker.clone();
+                    let harness_str = harness.to_string();
+                    fields = fields.with_on_select_action(DropdownAction::SelectActionAndClose(
+                        AIBlockAction::OrchestrateHarnessChanged {
+                            action_id: action_id_for_item,
+                            harness_type: harness_str.clone(),
+                        },
+                    ));
+                    if harness_str.eq_ignore_ascii_case(&initial_harness) {
+                        selected_idx = Some(idx);
+                    }
+                    items.push(MenuItem::Item(fields));
+                }
+                dropdown.set_rich_items(items, ctx_dropdown);
+                if let Some(idx) = selected_idx {
+                    dropdown.set_selected_by_index(idx, ctx_dropdown);
+                }
+                dropdown
+            }))
+        } else {
+            None
+        };
+
+        let environment_picker = if needs_env {
+            let action_id_for_picker = action_id.clone();
+            let initial_env = match &state.execution_mode {
+                OrchestrateExecutionMode::Remote { environment_id, .. } => environment_id.clone(),
+                OrchestrateExecutionMode::Local => String::new(),
+            };
+            Some(ctx.add_typed_action_view(move |ctx_dropdown| {
+                let mut dropdown = FilterableDropdown::<AIBlockAction>::new(ctx_dropdown);
+                dropdown.set_main_axis_size(MainAxisSize::Min, ctx_dropdown);
+                dropdown.set_button_variant(ButtonVariant::Secondary);
+                dropdown.set_menu_header_text_override(|t| format!("Environment: {t}"));
+                dropdown.set_menu_width(280.0, ctx_dropdown);
+
+                let envs = AgentConversationsModel::as_ref(ctx_dropdown)
+                    .get_all_environment_ids_and_names(ctx_dropdown);
+                let mut sorted_envs: Vec<(String, String)> = envs.into_iter().collect();
+                sorted_envs.sort_by(|a, b| a.1.cmp(&b.1));
+
+                let mut items: Vec<MenuItem<DropdownAction<AIBlockAction>>> = Vec::new();
+                let mut selected_name: Option<String> = None;
+                if sorted_envs.is_empty() {
+                    // Empty list: surface a placeholder header so the
+                    // user knows the picker is still loading the
+                    // available environments.
+                    dropdown.set_menu_header_text_override(|_| {
+                        "Environment: loading\u{2026}".to_string()
+                    });
+                }
+                for (env_id, env_name) in &sorted_envs {
+                    if env_id == &initial_env {
+                        selected_name = Some(env_name.clone());
+                    }
+                    let action_id_for_item = action_id_for_picker.clone();
+                    let env_id_for_item = env_id.clone();
+                    items.push(MenuItem::Item(
+                        MenuItemFields::new(env_name).with_on_select_action(
+                            DropdownAction::SelectActionAndClose(
+                                AIBlockAction::OrchestrateEnvironmentChanged {
+                                    action_id: action_id_for_item,
+                                    environment_id: env_id_for_item,
+                                },
+                            ),
+                        ),
+                    ));
+                }
+                dropdown.set_rich_items(items, ctx_dropdown);
+                if let Some(name) = selected_name {
+                    dropdown.set_selected_by_name(&name, ctx_dropdown);
+                }
+                dropdown
+            }))
+        } else {
+            None
+        };
+
+        let entry = self
+            .orchestrate_card_handles
+            .entry(action_id.clone())
+            .or_default();
+        if entry.model_picker.is_none() {
+            entry.model_picker = model_picker;
+        }
+        if entry.harness_picker.is_none() {
+            entry.harness_picker = harness_picker;
+        }
+        if entry.environment_picker.is_none() {
+            entry.environment_picker = environment_picker;
+        }
+    }
+
+    /// Re-sync the harness dropdown's displayed selection with the
+    /// authoritative `OrchestrateEditState`. Needed when the state mutates
+    /// outside of a dropdown click (e.g. Local→Cloud reset of
+    /// `OpenCode → Oz`); the model/environment dropdowns are always
+    /// updated by their own click path so they don't need re-syncing
+    /// here.
+    fn sync_orchestrate_picker_selections(
+        &mut self,
+        action_id: &AIAgentActionId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(state) = self.orchestrate_edit_states.get(action_id).cloned() else {
+            return;
+        };
+        let Some(handles) = self.orchestrate_card_handles.get(action_id).cloned() else {
+            return;
+        };
+        if let Some(harness_picker) = handles.harness_picker {
+            let target =
+                Harness::parse_orchestration_harness(&state.harness_type).unwrap_or(Harness::Oz);
+            let display = harness_display::display_name(target).to_string();
+            harness_picker.update(ctx, |dropdown, ctx_dropdown| {
+                dropdown.set_selected_by_name(&display, ctx_dropdown);
+            });
         }
     }
 

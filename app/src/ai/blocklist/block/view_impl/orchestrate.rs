@@ -3,28 +3,20 @@
 //! Modeled on the `orchestration.rs` sibling that renders `start_agent_v2`.
 //! Stage 1 covers the user-facing card states + interactive
 //! Reject / Edit / Accept buttons, the inline editor (Local/Cloud toggle,
-//! model/harness/environment cycle pickers, worker_host text-only with
+//! model/harness/environment dropdown pickers, worker_host text-only with
 //! TODO), and the Cloud-without-env / OpenCode+Cloud Accept-disabled
 //! validation gating.
 //!
 //! Spec references: TECH.md §8 ("Client: confirmation card"), §9
 //! ("Per-agent task creation"), PRODUCT.md "Confirmation card" + "Post-action
 //! card states" + "Invariants".
-//
-// TODO(QUALITY-569 fast-follow): the model/harness/environment cycle
-// buttons are functional placeholders for the full `Dropdown<A>` /
-// `FilterableDropdown<A>` integration. The interaction surface (action
-// dispatch, validation gating, edit state retention across mode toggles)
-// is identical; the Stage 2 fast-follow swaps the cycle buttons for real
-// dropdowns to give the user direct access to the full model/harness/env
-// picker UX matching `agent_management/view.rs`.
 
 use ai::agent::action::{OrchestrateExecutionMode, OrchestrateRequest};
 use ai::agent::action_result::{OrchestrateAgentOutcomeKind, OrchestrateResult};
 use pathfinder_color::ColorU;
 use warpui::elements::{
-    Container, CornerRadius, CrossAxisAlignment, Empty, Flex, Hoverable, MainAxisAlignment,
-    MainAxisSize, MouseStateHandle, ParentElement, Radius, Text,
+    ChildView, Container, CornerRadius, CrossAxisAlignment, Empty, Flex, Hoverable,
+    MainAxisAlignment, MainAxisSize, MouseStateHandle, ParentElement, Radius, Text,
 };
 use warpui::platform::Cursor;
 use warpui::{AppContext, Element, SingletonEntity};
@@ -374,46 +366,28 @@ fn render_editor(
     let mut column = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
 
     column.add_child(render_mode_toggle(action_id, state, handles, appearance));
-    column.add_child(render_picker_row(
-        "Model",
-        state.model_id.clone(),
-        AIBlockAction::OrchestrateModelChanged {
-            action_id: action_id.clone(),
-            model_id: cycle_model(&state.model_id),
-        },
-        handles.model_picker.clone(),
-        appearance,
-    ));
-    column.add_child(render_picker_row(
-        "Harness",
-        state.harness_type.clone(),
-        AIBlockAction::OrchestrateHarnessChanged {
-            action_id: action_id.clone(),
-            harness_type: cycle_harness(&state.harness_type),
-        },
-        handles.harness_picker.clone(),
-        appearance,
-    ));
-    if let OrchestrateExecutionMode::Remote {
-        environment_id,
-        worker_host,
-        ..
-    } = &state.execution_mode
-    {
+    if let Some(model_picker) = &handles.model_picker {
         column.add_child(render_picker_row(
-            "Environment",
-            if environment_id.is_empty() {
-                "(none selected)".to_string()
-            } else {
-                environment_id.clone()
-            },
-            AIBlockAction::OrchestrateEnvironmentChanged {
-                action_id: action_id.clone(),
-                environment_id: cycle_environment(environment_id),
-            },
-            handles.environment_picker.clone(),
+            "Model",
+            ChildView::new(model_picker).finish(),
             appearance,
         ));
+    }
+    if let Some(harness_picker) = &handles.harness_picker {
+        column.add_child(render_picker_row(
+            "Harness",
+            ChildView::new(harness_picker).finish(),
+            appearance,
+        ));
+    }
+    if let OrchestrateExecutionMode::Remote { worker_host, .. } = &state.execution_mode {
+        if let Some(env_picker) = &handles.environment_picker {
+            column.add_child(render_picker_row(
+                "Environment",
+                ChildView::new(env_picker).finish(),
+                appearance,
+            ));
+        }
         column.add_child(
             Container::new(
                 Text::new(
@@ -492,9 +466,7 @@ fn render_mode_toggle(
 
 fn render_picker_row(
     label: &str,
-    value: String,
-    on_click: AIBlockAction,
-    mouse_state: MouseStateHandle,
+    picker: Box<dyn Element>,
     appearance: &Appearance,
 ) -> Box<dyn Element> {
     let theme = appearance.theme();
@@ -505,33 +477,11 @@ fn render_picker_row(
     )
     .with_color(blended_colors::text_disabled(theme, theme.surface_2()))
     .finish();
-    let value_label = Text::new(
-        value,
-        appearance.ui_font_family(),
-        appearance.monospace_font_size(),
-    )
-    .finish();
-    let surface_2 = theme.surface_2().into();
-
-    let hoverable = Hoverable::new(mouse_state, move |_| {
-        Container::new(value_label)
-            .with_horizontal_padding(8.)
-            .with_vertical_padding(4.)
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
-            .with_background_color(surface_2)
-            .finish()
-    })
-    .on_click(move |ctx, _, _| {
-        ctx.dispatch_typed_action(on_click.clone());
-    })
-    .with_cursor(Cursor::PointingHand)
-    .finish();
-
     let row = Flex::row()
         .with_cross_axis_alignment(CrossAxisAlignment::Center)
         .with_main_axis_size(MainAxisSize::Min)
         .with_child(Container::new(label_el).with_margin_right(8.).finish())
-        .with_child(hoverable)
+        .with_child(picker)
         .finish();
     Container::new(row).with_margin_bottom(4.).finish()
 }
@@ -628,27 +578,6 @@ fn render_validation_error(reason: &str, appearance: &Appearance) -> Box<dyn Ele
     )
     .with_margin_top(6.)
     .finish()
-}
-
-fn cycle_model(current: &str) -> String {
-    const MODELS: &[&str] = &["auto", "claude-sonnet-4", "claude-opus-4", "gpt-5-thinking"];
-    let idx = MODELS.iter().position(|m| *m == current).unwrap_or(0);
-    MODELS[(idx + 1) % MODELS.len()].to_string()
-}
-
-fn cycle_harness(current: &str) -> String {
-    const HARNESSES: &[&str] = &["oz", "claude", "gemini"];
-    let idx = HARNESSES
-        .iter()
-        .position(|h| h.eq_ignore_ascii_case(current))
-        .unwrap_or(0);
-    HARNESSES[(idx + 1) % HARNESSES.len()].to_string()
-}
-
-fn cycle_environment(current: &str) -> String {
-    const ENVS: &[&str] = &["", "default-env", "staging-env", "prod-env"];
-    let idx = ENVS.iter().position(|e| *e == current).unwrap_or(0);
-    ENVS[(idx + 1) % ENVS.len()].to_string()
 }
 
 #[cfg(test)]
