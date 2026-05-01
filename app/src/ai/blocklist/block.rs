@@ -7013,7 +7013,19 @@ impl AIBlock {
             let picker_corner_radius_clone = picker_corner_radius;
             let picker_background_clone = picker_background_warpui;
             let picker_border_color_clone = picker_border_color_warpui;
-            Some(ctx.add_typed_action_view(move |ctx_dropdown| {
+            // Construct the Dropdown view first with only its appearance
+            // configured, then populate items + selection from the
+            // outer ViewContext via `update`. Setting `set_rich_items`
+            // / `set_selected_by_*` inside `add_typed_action_view`'s
+            // builder closure runs before the view is committed to the
+            // window's view registry, so the inner Menu read used by
+            // `set_selected_by_index` to refresh `Dropdown.selected_item`
+            // returns `None` and the top-bar label stays blank. Doing
+            // it via a follow-up `update(...)` matches the working
+            // pattern in `refresh_filterable_model_dropdown` /
+            // `refresh_coding_model_dropdown` in the execution-profile
+            // editor.
+            let dropdown_handle = ctx.add_typed_action_view(move |ctx_dropdown| {
                 let mut dropdown = Dropdown::<AIBlockAction>::new(ctx_dropdown);
                 // Render the open menu in the parent's Normal layer
                 // instead of an `Overlay` layer so menu-item clicks
@@ -7031,7 +7043,9 @@ impl AIBlock {
                 dropdown.set_border_width(ORCHESTRATE_PICKER_BORDER_WIDTH, ctx_dropdown);
                 dropdown.set_font_size(ORCHESTRATE_PICKER_FONT_SIZE, ctx_dropdown);
                 dropdown.set_font_color(picker_font_color, ctx_dropdown);
-
+                dropdown
+            });
+            dropdown_handle.update(ctx, |dropdown, ctx_dropdown| {
                 let llm_prefs = LLMPreferences::as_ref(ctx_dropdown);
                 let choices: Vec<_> = llm_prefs.get_base_llm_choices_for_agent_mode().collect();
                 let initial_index = choices
@@ -7058,8 +7072,8 @@ impl AIBlock {
                 if let Some(idx) = initial_index {
                     dropdown.set_selected_by_index(idx, ctx_dropdown);
                 }
-                dropdown
-            }))
+            });
+            Some(dropdown_handle)
         } else {
             None
         };
@@ -7071,9 +7085,9 @@ impl AIBlock {
             let picker_corner_radius_clone = picker_corner_radius;
             let picker_background_clone = picker_background_warpui;
             let picker_border_color_clone = picker_border_color_warpui;
-            Some(ctx.add_typed_action_view(move |ctx_dropdown| {
+            // See model picker note above.
+            let dropdown_handle = ctx.add_typed_action_view(move |ctx_dropdown| {
                 let mut dropdown = Dropdown::<AIBlockAction>::new(ctx_dropdown);
-                // See model picker note above.
                 dropdown.set_use_overlay_layer(false, ctx_dropdown);
                 dropdown.set_main_axis_size(MainAxisSize::Max, ctx_dropdown);
                 dropdown.set_menu_header_text_override(|t| format!("Harness: {t}"));
@@ -7086,7 +7100,9 @@ impl AIBlock {
                 dropdown.set_border_width(ORCHESTRATE_PICKER_BORDER_WIDTH, ctx_dropdown);
                 dropdown.set_font_size(ORCHESTRATE_PICKER_FONT_SIZE, ctx_dropdown);
                 dropdown.set_font_color(picker_font_color, ctx_dropdown);
-
+                dropdown
+            });
+            dropdown_handle.update(ctx, |dropdown, ctx_dropdown| {
                 let mut items: Vec<MenuItem<DropdownAction<AIBlockAction>>> = Vec::new();
                 let mut selected_idx = None;
                 for (idx, harness) in [Harness::Oz, Harness::Claude, Harness::Gemini]
@@ -7115,8 +7131,8 @@ impl AIBlock {
                 if let Some(idx) = selected_idx {
                     dropdown.set_selected_by_index(idx, ctx_dropdown);
                 }
-                dropdown
-            }))
+            });
+            Some(dropdown_handle)
         } else {
             None
         };
@@ -7128,16 +7144,18 @@ impl AIBlock {
                 OrchestrateExecutionMode::Local => String::new(),
             };
             let picker_styles_clone = picker_styles;
-            Some(ctx.add_typed_action_view(move |ctx_dropdown| {
+            // See model picker note above.
+            let dropdown_handle = ctx.add_typed_action_view(move |ctx_dropdown| {
                 let mut dropdown = FilterableDropdown::<AIBlockAction>::new(ctx_dropdown);
-                // See model picker note above.
                 dropdown.set_use_overlay_layer(false, ctx_dropdown);
                 dropdown.set_main_axis_size(MainAxisSize::Max, ctx_dropdown);
                 dropdown.set_button_variant(ButtonVariant::Secondary);
                 dropdown.set_style(picker_styles_clone);
                 dropdown.set_menu_header_text_override(|t| format!("Environment: {t}"));
+                dropdown
+            });
+            dropdown_handle.update(ctx, |dropdown, ctx_dropdown| {
                 dropdown.set_menu_width(280.0, ctx_dropdown);
-
                 let envs = AgentConversationsModel::as_ref(ctx_dropdown)
                     .get_all_environment_ids_and_names(ctx_dropdown);
                 let mut sorted_envs: Vec<(String, String)> = envs.into_iter().collect();
@@ -7174,8 +7192,8 @@ impl AIBlock {
                 if let Some(name) = selected_name {
                     dropdown.set_selected_by_name(&name, ctx_dropdown);
                 }
-                dropdown
-            }))
+            });
+            Some(dropdown_handle)
         } else {
             None
         };
@@ -7192,9 +7210,9 @@ impl AIBlock {
             let picker_corner_radius_clone = picker_corner_radius;
             let picker_background_clone = picker_background_warpui;
             let picker_border_color_clone = picker_border_color_warpui;
-            Some(ctx.add_typed_action_view(move |ctx_dropdown| {
+            // See model picker note above.
+            let dropdown_handle = ctx.add_typed_action_view(move |ctx_dropdown| {
                 let mut dropdown = Dropdown::<AIBlockAction>::new(ctx_dropdown);
-                // See model picker note above.
                 dropdown.set_use_overlay_layer(false, ctx_dropdown);
                 dropdown.set_main_axis_size(MainAxisSize::Max, ctx_dropdown);
                 dropdown.set_menu_header_text_override(|t| format!("Host: {t}"));
@@ -7207,6 +7225,9 @@ impl AIBlock {
                 dropdown.set_border_width(ORCHESTRATE_PICKER_BORDER_WIDTH, ctx_dropdown);
                 dropdown.set_font_size(ORCHESTRATE_PICKER_FONT_SIZE, ctx_dropdown);
                 dropdown.set_font_color(picker_font_color, ctx_dropdown);
+                dropdown
+            });
+            dropdown_handle.update(ctx, |dropdown, ctx_dropdown| {
                 let item = MenuItemFields::new("Warp".to_string()).with_on_select_action(
                     DropdownAction::SelectActionAndClose(
                         AIBlockAction::OrchestrateAcceptMenuToggled {
@@ -7216,8 +7237,8 @@ impl AIBlock {
                 );
                 dropdown.set_rich_items(vec![MenuItem::Item(item)], ctx_dropdown);
                 dropdown.set_selected_by_index(0, ctx_dropdown);
-                dropdown
-            }))
+            });
+            Some(dropdown_handle)
         } else {
             None
         };
