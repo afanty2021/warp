@@ -6672,6 +6672,15 @@ impl TypedActionView for AIBlock {
                 if let Some(state) = self.orchestrate_edit_states.get_mut(action_id) {
                     state.model_id = model_id.clone();
                 }
+                // Note: do NOT call `sync_orchestrate_picker_selections`
+                // here. This action is dispatched synchronously from the
+                // model_picker dropdown's `select_action_and_close` while
+                // its `update_view` is mid-execution; calling
+                // `model_picker.update(...)` from this handler would
+                // panic with "Circular view update". The dropdown's own
+                // `MenuEvent::ItemSelected` subscription (registered in
+                // `Dropdown::new`) updates the displayed selection after
+                // the dispatch chain unwinds.
             }
             AIBlockAction::OrchestrateHarnessChanged {
                 action_id,
@@ -6680,6 +6689,7 @@ impl TypedActionView for AIBlock {
                 if let Some(state) = self.orchestrate_edit_states.get_mut(action_id) {
                     state.harness_type = harness_type.clone();
                 }
+                // See note on OrchestrateModelChanged above.
             }
             AIBlockAction::OrchestrateEnvironmentChanged {
                 action_id,
@@ -6688,6 +6698,7 @@ impl TypedActionView for AIBlock {
                 if let Some(state) = self.orchestrate_edit_states.get_mut(action_id) {
                     state.set_environment_id(environment_id.clone());
                 }
+                // See note on OrchestrateModelChanged above.
             }
             AIBlockAction::OrchestrateAccept { action_id } => {
                 self.handle_orchestrate_accept(action_id, ctx);
@@ -7259,14 +7270,22 @@ impl AIBlock {
         if entry.host_picker.is_none() {
             entry.host_picker = host_picker;
         }
+        // Force the picker top-bar labels to reflect the current state.
+        // The Dropdown's internal `MenuEvent::ItemSelected` subscription
+        // turns out to be unreliable inside the AIBlock's view tree (the
+        // top-bar text stays blank even after the menu's selected_row_index
+        // is set), so we explicitly drive the displayed selection here
+        // and again after every state-mutating action via
+        // `sync_orchestrate_picker_selections`.
+        self.sync_orchestrate_picker_selections(action_id, ctx);
     }
 
-    /// Re-sync the harness dropdown's displayed selection with the
-    /// authoritative `OrchestrateEditState`. Needed when the state mutates
-    /// outside of a dropdown click (e.g. Local→Cloud reset of
-    /// `OpenCode → Oz`); the model/environment dropdowns are always
-    /// updated by their own click path so they don't need re-syncing
-    /// here.
+    /// Re-sync each picker's displayed selection with the authoritative
+    /// `OrchestrateEditState`. Called after creating the pickers and
+    /// after every state-mutating action (Local/Cloud toggle,
+    /// OrchestrateModelChanged, OrchestrateHarnessChanged,
+    /// OrchestrateEnvironmentChanged) so the top-bar label always
+    /// matches the underlying state.
     fn sync_orchestrate_picker_selections(
         &mut self,
         action_id: &AIAgentActionId,
@@ -7278,12 +7297,44 @@ impl AIBlock {
         let Some(handles) = self.orchestrate_card_handles.get(action_id).cloned() else {
             return;
         };
+        if let Some(model_picker) = handles.model_picker {
+            let target_model_id = state.model_id.clone();
+            model_picker.update(ctx, |dropdown, ctx_dropdown| {
+                let llm_prefs = LLMPreferences::as_ref(ctx_dropdown);
+                let choices: Vec<_> = llm_prefs.get_base_llm_choices_for_agent_mode().collect();
+                if let Some(idx) = choices
+                    .iter()
+                    .position(|llm| llm.id.to_string() == target_model_id)
+                {
+                    dropdown.set_selected_by_index(idx, ctx_dropdown);
+                }
+            });
+        }
         if let Some(harness_picker) = handles.harness_picker {
             let target =
                 Harness::parse_orchestration_harness(&state.harness_type).unwrap_or(Harness::Oz);
             let display = harness_display::display_name(target).to_string();
             harness_picker.update(ctx, |dropdown, ctx_dropdown| {
                 dropdown.set_selected_by_name(&display, ctx_dropdown);
+            });
+        }
+        if let Some(environment_picker) = handles.environment_picker {
+            let env_id = match &state.execution_mode {
+                OrchestrateExecutionMode::Remote { environment_id, .. } => environment_id.clone(),
+                OrchestrateExecutionMode::Local => String::new(),
+            };
+            environment_picker.update(ctx, |dropdown, ctx_dropdown| {
+                let envs = AgentConversationsModel::as_ref(ctx_dropdown)
+                    .get_all_environment_ids_and_names(ctx_dropdown);
+                if let Some((_, name)) = envs.into_iter().find(|(id, _)| id == &env_id) {
+                    dropdown.set_selected_by_name(&name, ctx_dropdown);
+                }
+            });
+        }
+        if let Some(host_picker) = handles.host_picker {
+            // Single visual-only "Warp" item; index 0 is always correct.
+            host_picker.update(ctx, |dropdown, ctx_dropdown| {
+                dropdown.set_selected_by_index(0, ctx_dropdown);
             });
         }
     }
