@@ -140,6 +140,15 @@ where
         ctx.notify();
     }
 
+    /// Override the top-bar height. Mirrors `Dropdown::set_top_bar_height`
+    /// so callers (e.g. the orchestrate environment picker) that mix
+    /// `Dropdown` and `FilterableDropdown` in the same row can size them
+    /// identically.
+    pub fn set_top_bar_height(&mut self, height: f32, ctx: &mut ViewContext<Self>) {
+        self.top_bar_height = height;
+        ctx.notify();
+    }
+
     pub fn set_menu_header_text_override<F>(&mut self, formatter: F)
     where
         F: Fn(&str) -> String + 'static,

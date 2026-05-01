@@ -7170,6 +7170,11 @@ impl AIBlock {
                 dropdown.set_button_variant(ButtonVariant::Secondary);
                 dropdown.set_style(picker_styles_clone);
                 dropdown.set_menu_header_text_override(|t| format!("Environment: {t}"));
+                // Match the Dropdown-based pickers' top-bar height so
+                // all four pickers in the row are the same size. The
+                // default `FilterableDropdown` height is 30; the other
+                // pickers use 36 per Figma 4340:117057.
+                dropdown.set_top_bar_height(ORCHESTRATE_PICKER_HEIGHT, ctx_dropdown);
                 dropdown
             });
             dropdown_handle.update(ctx, |dropdown, ctx_dropdown| {
@@ -7178,6 +7183,16 @@ impl AIBlock {
                     .get_all_environment_ids_and_names(ctx_dropdown);
                 let mut sorted_envs: Vec<(String, String)> = envs.into_iter().collect();
                 sorted_envs.sort_by(|a, b| a.1.cmp(&b.1));
+                // [orchestrate-debug] Diagnostic for QUALITY-569 polish
+                // round 3: surface how many environments the picker
+                // received at construction time. If this is 0, the env
+                // list isn't loaded yet \u2014 the user can verify by opening
+                // the orchestration sidebar / agent management page once
+                // (which force-loads envs) before re-testing.
+                log::info!(
+                    "[orchestrate-debug] env picker populated with {} envs",
+                    sorted_envs.len()
+                );
 
                 let mut items: Vec<MenuItem<DropdownAction<AIBlockAction>>> = Vec::new();
                 let mut selected_name: Option<String> = None;

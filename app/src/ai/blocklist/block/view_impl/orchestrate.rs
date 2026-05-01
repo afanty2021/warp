@@ -22,10 +22,11 @@
 
 use ai::agent::action::OrchestrateRequest;
 use ai::agent::action_result::{OrchestrateAgentOutcomeKind, OrchestrateResult};
+use pathfinder_color::ColorU;
 use std::rc::Rc;
 use warpui::elements::{
-    Border, ChildView, Container, CornerRadius, CrossAxisAlignment, Empty, Expanded, Flex,
-    Hoverable, MainAxisSize, MouseStateHandle, ParentElement, Radius, Text,
+    Border, ChildView, Container, CornerRadius, CrossAxisAlignment, Empty, Expanded, Fill, Flex,
+    Hoverable, MainAxisAlignment, MainAxisSize, MouseStateHandle, ParentElement, Radius, Text,
 };
 use warpui::platform::Cursor;
 use warpui::{AppContext, Element, SingletonEntity};
@@ -77,11 +78,26 @@ pub(super) fn render_orchestrate(
         return Empty::new().finish();
     }
 
+    // Restored-from-history but not finished: there's no point in
+    // showing an interactive confirmation card because the action's
+    // pending dispatch state has been lost on restore. Render as
+    // Cancelled, mirroring how `set_restored_file_edits` on the
+    // apply-diff tool call marks restored-pending edits as Rejected
+    // (block.rs ~line 3241).
+    if props.model.is_restored() {
+        return render_status_only_card(
+            "Orchestration cancelled".to_string(),
+            appearance,
+            StatusKind::Cancelled,
+            app,
+        );
+    }
+
     // Pre-dispatch confirmation layout. Pulls per-action edit state +
     // button handles from the AIBlock; the LLM-supplied request is the
     // source of truth until the user clicks Edit. Per the polish round
     // (P2.4) we no longer render a separate "Preparing orchestration..."
-    // placeholder during streaming — the confirmation card stands in for
+    // placeholder during streaming \u2014 the confirmation card stands in for
     // that intermediate state, mirroring how the edit/apply-diff
     // tool-call card behaves before the user accepts.
     let display_state = props
@@ -330,15 +346,23 @@ fn render_status_only_card(
         false,
         app,
     );
-    // Match the confirmation card's outer spacing (P2.6) so the post-action
-    // card sits in the same indentation lane and has consistent bottom
-    // breathing room before the next output item.
-    Container::new(row)
-        .with_background_color(blended_colors::neutral_2(theme))
-        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
-        .finish()
-        .with_agent_output_item_spacing(app)
-        .finish()
+    // P3.2: post-action card uses the indented "narrow" inline-action
+    // lane. The active confirmation card spans the full block width
+    // (set by `render_confirmation_card`); once the action transitions
+    // to a terminal state we render this status row indented from
+    // both edges so it visually matches the post-action presentation
+    // of other tool-call cards (e.g. apply-diff).
+    Container::new(
+        Container::new(row)
+            .with_background_color(blended_colors::neutral_2(theme))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+            .finish(),
+    )
+    .with_margin_left(16.)
+    .with_margin_right(16.)
+    .finish()
+    .with_agent_output_item_spacing(app)
+    .finish()
 }
 
 fn render_editor(
@@ -368,12 +392,15 @@ fn render_editor(
         .finish()
 }
 
-/// Renders the four-column dropdown row beneath the Local/Cloud toggle.
-/// Wraps each picker in `Expanded::new(1.0, ...)` so the columns share the
-/// available width equally; the parent `Flex::row` is set to
-/// `MainAxisSize::Max` to opt the children into flexible sizing.
+/// Renders the dropdown row beneath the Local/Cloud toggle. Per spec
+/// PRODUCT.md "Default state and prepopulation rules", Local mode shows
+/// only `Agent harness` + `Base model`; Cloud mode adds `Host` +
+/// `Environment` between them. Wraps each picker in `Expanded::new(1.0,
+/// \u2026)` so the columns share the available width equally; the parent
+/// `Flex::row` is set to `MainAxisSize::Max` to opt the children into
+/// flexible sizing.
 fn render_picker_row_quad(
-    _state: &OrchestrateEditState,
+    state: &OrchestrateEditState,
     handles: &OrchestrateCardHandles,
     appearance: &Appearance,
 ) -> Box<dyn Element> {
@@ -396,34 +423,40 @@ fn render_picker_row_quad(
         )
         .finish(),
     );
-    row.add_child(
-        Expanded::new(
-            1.0,
-            render_picker_column(
-                "Host",
-                handles
-                    .host_picker
-                    .as_ref()
-                    .map(|p| ChildView::new(p).finish()),
-                appearance,
-            ),
-        )
-        .finish(),
-    );
-    row.add_child(
-        Expanded::new(
-            1.0,
-            render_picker_column(
-                "Environment",
-                handles
-                    .environment_picker
-                    .as_ref()
-                    .map(|p| ChildView::new(p).finish()),
-                appearance,
-            ),
-        )
-        .finish(),
-    );
+    // Host + Environment only render in Cloud (Remote) mode. Local mode
+    // hides them per PRODUCT.md \u00a7"Default state and prepopulation rules";
+    // the underlying `OrchestrateExecutionMode::Local` variant has no
+    // host or environment fields.
+    if state.execution_mode.is_remote() {
+        row.add_child(
+            Expanded::new(
+                1.0,
+                render_picker_column(
+                    "Host",
+                    handles
+                        .host_picker
+                        .as_ref()
+                        .map(|p| ChildView::new(p).finish()),
+                    appearance,
+                ),
+            )
+            .finish(),
+        );
+        row.add_child(
+            Expanded::new(
+                1.0,
+                render_picker_column(
+                    "Environment",
+                    handles
+                        .environment_picker
+                        .as_ref()
+                        .map(|p| ChildView::new(p).finish()),
+                    appearance,
+                ),
+            )
+            .finish(),
+        );
+    }
     row.add_child(
         Expanded::new(
             1.0,
@@ -464,6 +497,12 @@ fn render_picker_column(
         .finish()
 }
 
+/// Renders the "Agent location" label above a Local/Cloud segmented
+/// control. Per Figma node 4340:117057 the segmented control is a
+/// single rounded container with a translucent overlay background; the
+/// selected option has a lighter rounded fill, and the unselected
+/// option is fully transparent with muted text \u2014 only the labels are
+/// visible side-by-side, with no border between them.
 fn render_mode_toggle(
     action_id: &AIAgentActionId,
     state: &OrchestrateEditState,
@@ -473,13 +512,14 @@ fn render_mode_toggle(
     let theme = appearance.theme();
     let is_remote = state.execution_mode.is_remote();
     let label = Text::new(
-        "Run on:".to_string(),
+        "Agent location".to_string(),
         appearance.ui_font_family(),
-        appearance.monospace_font_size(),
+        appearance.monospace_font_size() - 1.,
     )
     .with_color(blended_colors::text_disabled(theme, theme.surface_1()))
     .finish();
-    let local_button = render_segment_button(
+
+    let local_segment = render_segment_button(
         "Local",
         !is_remote,
         AIBlockAction::OrchestrateExecutionModeToggled {
@@ -489,7 +529,7 @@ fn render_mode_toggle(
         handles.local_toggle.clone(),
         appearance,
     );
-    let cloud_button = render_segment_button(
+    let cloud_segment = render_segment_button(
         "Cloud",
         is_remote,
         AIBlockAction::OrchestrateExecutionModeToggled {
@@ -499,14 +539,32 @@ fn render_mode_toggle(
         handles.cloud_toggle.clone(),
         appearance,
     );
-    let row = Flex::row()
-        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+
+    // Single segmented-control container. Figma 4340:117057 specifies a
+    // ~5% foreground overlay background (`fg_overlay_1`) with 4px inner
+    // padding around two equal-width segments.
+    let segment_outer_bg: Fill = Fill::Solid(ColorU::new(0xfa, 0xf9, 0xf6, 0x1a)); // rgba(250,249,246,0.10)
+    let segments_row = Flex::row()
+        .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+        .with_main_axis_alignment(MainAxisAlignment::Start)
         .with_main_axis_size(MainAxisSize::Min)
-        .with_child(Container::new(label).with_margin_right(8.).finish())
-        .with_child(local_button)
-        .with_child(cloud_button)
+        .with_child(local_segment)
+        .with_child(cloud_segment)
         .finish();
-    Container::new(row).with_margin_bottom(6.).finish()
+    let segmented_control = Container::new(segments_row)
+        .with_padding_top(4.)
+        .with_padding_bottom(4.)
+        .with_padding_left(4.)
+        .with_padding_right(4.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+        .with_background(segment_outer_bg)
+        .finish();
+
+    Flex::column()
+        .with_cross_axis_alignment(CrossAxisAlignment::Start)
+        .with_child(Container::new(label).with_margin_bottom(4.).finish())
+        .with_child(segmented_control)
+        .finish()
 }
 
 fn render_segment_button(
@@ -517,28 +575,36 @@ fn render_segment_button(
     appearance: &Appearance,
 ) -> Box<dyn Element> {
     let theme = appearance.theme();
-    let bg = if is_active {
-        theme.surface_3().into()
-    } else {
-        theme.surface_2().into()
-    };
     let label_owned = label.to_string();
     let font_family = appearance.ui_font_family();
     let font_size = appearance.monospace_font_size();
-    let hoverable = Hoverable::new(mouse_state, move |_| {
-        Container::new(Text::new(label_owned.clone(), font_family, font_size).finish())
-            .with_horizontal_padding(8.)
+    // Selected segment: lighter rounded background. Unselected: fully
+    // transparent with muted text, blending into the outer container.
+    let active_text_color = blended_colors::text_main(theme, theme.surface_1());
+    let inactive_text_color = blended_colors::text_disabled(theme, theme.surface_1());
+    let segment_active_bg: Fill = Fill::Solid(ColorU::new(0xfa, 0xf9, 0xf6, 0x33)); // rgba(250,249,246,0.20)
+    Hoverable::new(mouse_state, move |_| {
+        let text = Text::new(label_owned.clone(), font_family, font_size)
+            .with_color(if is_active {
+                active_text_color
+            } else {
+                inactive_text_color
+            })
+            .finish();
+        let mut container = Container::new(text)
+            .with_horizontal_padding(12.)
             .with_vertical_padding(4.)
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
-            .with_background_color(bg)
-            .finish()
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)));
+        if is_active {
+            container = container.with_background(segment_active_bg);
+        }
+        container.finish()
     })
     .on_click(move |ctx, _, _| {
         ctx.dispatch_typed_action(on_click.clone());
     })
     .with_cursor(Cursor::PointingHand)
-    .finish();
-    Container::new(hoverable).with_margin_right(4.).finish()
+    .finish()
 }
 
 fn render_validation_error(reason: &str, appearance: &Appearance) -> Box<dyn Element> {
