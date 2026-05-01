@@ -6979,9 +6979,16 @@ impl AIBlock {
         const ORCHESTRATE_PICKER_RADIUS: f32 = 4.;
         const ORCHESTRATE_PICKER_BORDER_WIDTH: f32 = 1.;
         const ORCHESTRATE_PICKER_FONT_SIZE: f32 = 14.;
+        // Vertical padding must leave room for the text line.
+        // top_bar_height (36) - padding_top - padding_bottom must be
+        // >= font_size * line_height_ratio (~14 * 1.4 \u2248 20). With 10/10
+        // vertical padding the inner area is 16px, which is too small;
+        // the text element silently fails to render (the icon still
+        // renders because it's wrapped in its own 15x15 ConstrainedBox).
+        // 8/8 leaves 20px which matches the text's natural height.
         let picker_padding = Coords {
-            top: 10.,
-            bottom: 10.,
+            top: 8.,
+            bottom: 8.,
             left: 12.,
             right: 12.,
         };
@@ -6994,10 +7001,7 @@ impl AIBlock {
         // both types here once and reuse them across closures.
         let picker_border_color_warpui: warpui::elements::Fill =
             Fill::Solid(ColorU::new(0x29, 0x29, 0x29, 0xff)).into();
-        // [orchestrate-debug] Temporarily set to bright magenta to verify
-        // text-rendering. If still blank with this color, it's a layout
-        // issue, not a color issue.
-        let picker_font_color = ColorU::new(0xff, 0x00, 0xff, 0xff);
+        let picker_font_color = ColorU::new(0xe3, 0xe2, 0xdf, 0xff);
         let picker_background_theme: Fill = Appearance::as_ref(ctx).theme().surface_overlay_1();
         let picker_background_warpui: warpui::elements::Fill = picker_background_theme.into();
         let picker_styles = UiComponentStyles {
