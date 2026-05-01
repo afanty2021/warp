@@ -7015,6 +7015,11 @@ impl AIBlock {
             let picker_border_color_clone = picker_border_color_warpui;
             Some(ctx.add_typed_action_view(move |ctx_dropdown| {
                 let mut dropdown = Dropdown::<AIBlockAction>::new(ctx_dropdown);
+                // Render the open menu in the parent's Normal layer
+                // instead of an `Overlay` layer so menu-item clicks
+                // aren't swallowed by the surrounding AIBlock
+                // `SelectableArea` interaction. See `Dropdown::use_overlay_layer`.
+                dropdown.set_use_overlay_layer(false, ctx_dropdown);
                 dropdown.set_main_axis_size(MainAxisSize::Max, ctx_dropdown);
                 dropdown.set_menu_header_text_override(|t| format!("Model: {t}"));
                 dropdown.set_style(DropdownStyle::ActionButtonSecondary, ctx_dropdown);
@@ -7068,6 +7073,8 @@ impl AIBlock {
             let picker_border_color_clone = picker_border_color_warpui;
             Some(ctx.add_typed_action_view(move |ctx_dropdown| {
                 let mut dropdown = Dropdown::<AIBlockAction>::new(ctx_dropdown);
+                // See model picker note above.
+                dropdown.set_use_overlay_layer(false, ctx_dropdown);
                 dropdown.set_main_axis_size(MainAxisSize::Max, ctx_dropdown);
                 dropdown.set_menu_header_text_override(|t| format!("Harness: {t}"));
                 dropdown.set_style(DropdownStyle::ActionButtonSecondary, ctx_dropdown);
@@ -7123,6 +7130,8 @@ impl AIBlock {
             let picker_styles_clone = picker_styles;
             Some(ctx.add_typed_action_view(move |ctx_dropdown| {
                 let mut dropdown = FilterableDropdown::<AIBlockAction>::new(ctx_dropdown);
+                // See model picker note above.
+                dropdown.set_use_overlay_layer(false, ctx_dropdown);
                 dropdown.set_main_axis_size(MainAxisSize::Max, ctx_dropdown);
                 dropdown.set_button_variant(ButtonVariant::Secondary);
                 dropdown.set_style(picker_styles_clone);
@@ -7185,6 +7194,8 @@ impl AIBlock {
             let picker_border_color_clone = picker_border_color_warpui;
             Some(ctx.add_typed_action_view(move |ctx_dropdown| {
                 let mut dropdown = Dropdown::<AIBlockAction>::new(ctx_dropdown);
+                // See model picker note above.
+                dropdown.set_use_overlay_layer(false, ctx_dropdown);
                 dropdown.set_main_axis_size(MainAxisSize::Max, ctx_dropdown);
                 dropdown.set_menu_header_text_override(|t| format!("Host: {t}"));
                 dropdown.set_style(DropdownStyle::ActionButtonSecondary, ctx_dropdown);

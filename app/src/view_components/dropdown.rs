@@ -96,6 +96,22 @@ pub struct Dropdown<A: Action + Clone> {
     border_radius: Option<CornerRadius>,
     vertical_margin: f32,
     top_bar_height: f32,
+    /// When true (default), the open menu is attached to the dropdown's
+    /// stack via `add_positioned_overlay_child`, painting it in an
+    /// `Overlay` layer that escapes parent clip bounds. When false, the
+    /// menu is attached via `add_positioned_child` and paints in the
+    /// parent's Normal layer, the same way other AIBlock-internal
+    /// menus (e.g. the accept-and-autoexecute split-button menu in
+    /// `requested_command.rs` / `code_diff_view.rs`) do.
+    ///
+    /// Setting this to `false` is required for dropdowns rendered
+    /// inside a `SelectableArea` whose menu items would otherwise lose
+    /// `LeftMouseDown` / `LeftMouseUp` (hover still works) due to an
+    /// interaction between `Menu`'s `prevent_interaction_with_other_elements`
+    /// full-window hit-recording rect and the surrounding
+    /// `SelectableArea`. Tracked as P1.1 for the orchestrate
+    /// confirmation card pickers.
+    use_overlay_layer: bool,
 }
 
 #[derive(Clone)]
@@ -209,7 +225,17 @@ where
             border_radius: None,
             vertical_margin: DROPDOWN_PADDING,
             top_bar_height: TOP_MENU_BAR_HEIGHT,
+            use_overlay_layer: true,
         }
+    }
+
+    /// Controls whether the open menu is rendered in an `Overlay`
+    /// layer (default) or attached as a positioned child in the
+    /// dropdown stack's Normal layer. See the field-level docs on
+    /// `use_overlay_layer` for when each is appropriate.
+    pub fn set_use_overlay_layer(&mut self, use_overlay_layer: bool, ctx: &mut ViewContext<Self>) {
+        self.use_overlay_layer = use_overlay_layer;
+        ctx.notify();
     }
 
     pub fn set_background(&mut self, background: Fill, ctx: &mut ViewContext<Self>) {
@@ -587,16 +613,18 @@ where
                     .with_drop_shadow(DropShadow::default())
                     .finish();
             }
-            dropdown_stack.add_positioned_overlay_child(
-                menu,
-                OffsetPositioning::offset_from_save_position_element(
-                    self.top_bar_label(),
-                    vec2f(0., 0.),
-                    PositionedElementOffsetBounds::WindowByPosition,
-                    self.element_anchor,
-                    self.child_anchor,
-                ),
+            let positioning = OffsetPositioning::offset_from_save_position_element(
+                self.top_bar_label(),
+                vec2f(0., 0.),
+                PositionedElementOffsetBounds::WindowByPosition,
+                self.element_anchor,
+                self.child_anchor,
             );
+            if self.use_overlay_layer {
+                dropdown_stack.add_positioned_overlay_child(menu, positioning);
+            } else {
+                dropdown_stack.add_positioned_child(menu, positioning);
+            }
         }
         Container::new(dropdown_stack.finish())
             .with_margin_top(self.vertical_margin)
