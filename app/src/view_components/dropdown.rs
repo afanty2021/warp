@@ -385,11 +385,21 @@ where
         selected_item: impl AsRef<str>,
         ctx: &mut ViewContext<Self>,
     ) {
+        let target = selected_item.as_ref().to_string();
         self.dropdown.update(ctx, |dropdown, ctx| {
-            dropdown.set_selected_by_name(selected_item, ctx);
+            dropdown.set_selected_by_name(&target, ctx);
             ctx.notify();
         });
         self.selected_item = self.selected_item(ctx);
+        // [orchestrate-debug] Temporary diagnostic.
+        let label = match &self.selected_item {
+            Some(MenuItem::Item(fields)) => fields.label().to_string(),
+            Some(_) => "<non-Item variant>".to_string(),
+            None => "<None>".to_string(),
+        };
+        log::info!(
+            "[orchestrate-debug] Dropdown::set_selected_by_name({target:?}) -> selected_item label={label:?}"
+        );
         ctx.notify();
     }
 
@@ -400,6 +410,16 @@ where
             ctx.notify();
         });
         self.selected_item = self.selected_item(ctx);
+        // [orchestrate-debug] Temporary diagnostic for QUALITY-569 blank
+        // top-bar issue. Remove once root cause is identified.
+        let label = match &self.selected_item {
+            Some(MenuItem::Item(fields)) => fields.label().to_string(),
+            Some(_) => "<non-Item variant>".to_string(),
+            None => "<None>".to_string(),
+        };
+        log::info!(
+            "[orchestrate-debug] Dropdown::set_selected_by_index({selected_index}) -> selected_item label={label:?}"
+        );
         ctx.notify();
     }
 
@@ -487,6 +507,13 @@ where
             }
             _ => (String::new(), None),
         };
+        // [orchestrate-debug] Temporary diagnostic. Logs the text the
+        // top-bar is about to render. Will fire on every render so it'll
+        // be noisy; remove once root cause is identified.
+        log::info!(
+            "[orchestrate-debug] Dropdown::render_top_bar text={selected_item_text:?} selected_item_is_some={}",
+            self.selected_item.is_some()
+        );
         let mut top_bar = appearance
             .ui_builder()
             .button(
@@ -563,6 +590,15 @@ where
             MenuEvent::Close { via_select_item: _ } => self.close(ctx),
             MenuEvent::ItemSelected => {
                 self.selected_item = self.selected_item(ctx);
+                // [orchestrate-debug] Temporary diagnostic.
+                let label = match &self.selected_item {
+                    Some(MenuItem::Item(fields)) => fields.label().to_string(),
+                    Some(_) => "<non-Item variant>".to_string(),
+                    None => "<None>".to_string(),
+                };
+                log::info!(
+                    "[orchestrate-debug] Dropdown::handle_menu_event(ItemSelected) -> selected_item label={label:?}"
+                );
                 ctx.notify();
             }
             MenuEvent::ItemHovered => {}
