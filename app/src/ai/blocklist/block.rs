@@ -474,6 +474,12 @@ pub(super) struct OrchestrateCardHandles {
     pub(super) model_picker: Option<ViewHandle<Dropdown<AIBlockAction>>>,
     pub(super) harness_picker: Option<ViewHandle<Dropdown<AIBlockAction>>>,
     pub(super) environment_picker: Option<ViewHandle<FilterableDropdown<AIBlockAction>>>,
+    /// Visual-only host picker (currently always "Warp"). The picker is
+    /// non-functional today — the worker host is fixed at `"warp"` and
+    /// editing it is a fast-follow per spec. Constructing it as a real
+    /// `Dropdown` keeps the four-column editor layout consistent with
+    /// Figma node 4340:117057.
+    pub(super) host_picker: Option<ViewHandle<Dropdown<AIBlockAction>>>,
 }
 
 /// Like `SecondaryTheme` but with grey text instead of white.
@@ -6778,12 +6784,13 @@ impl AIBlock {
         self.sync_orchestrate_card_buttons(action_id, ctx);
     }
 
-    /// Update the Reject (and, eventually, Edit) button labels/keystrokes
-    /// on the orchestrate confirmation card to reflect the current
-    /// `OrchestrateEditState`. Specifically, when the inline editor is
-    /// open the Reject button becomes "Discard edits" with an `Esc`
-    /// shortcut chip; when it's closed it reverts to "Reject" with
-    /// `Ctrl-C`. Idempotent and safe to call repeatedly; if the buttons
+    /// Update the Edit button label/keystroke on the orchestrate
+    /// confirmation card to reflect the current `OrchestrateEditState`.
+    /// Per Figma 4340:117057, when the inline editor is open the Edit
+    /// button becomes "Discard edits" with an `Esc` shortcut chip; when
+    /// it's closed it reverts to "Edit" with `Cmd/Ctrl-E`. The Reject
+    /// button is unaffected by editor state — it stays "Reject" / `\u2303C`
+    /// in both. Idempotent and safe to call repeatedly; if the buttons
     /// or edit state for the action are missing this is a no-op.
     fn sync_orchestrate_card_buttons(
         &mut self,
@@ -6797,7 +6804,7 @@ impl AIBlock {
         let Some(handles) = self.orchestrate_card_handles.get(action_id).cloned() else {
             return;
         };
-        let Some(mut reject_button) = handles.reject_button else {
+        let Some(mut edit_button) = handles.edit_button else {
             return;
         };
         let (label, keystroke) = if is_editor_open {
@@ -6808,17 +6815,17 @@ impl AIBlock {
             )
         } else {
             (
-                "Reject".to_string(),
-                Keystroke::parse("ctrl-c")
-                    .expect("orchestrate reject keystroke literal must parse"),
+                "Edit".to_string(),
+                Keystroke::parse("cmdorctrl-e")
+                    .expect("orchestrate edit keystroke literal must parse"),
             )
         };
-        reject_button.set_label(label, ctx);
-        reject_button.set_keybinding(Some(KeystrokeSource::Fixed(keystroke)), ctx);
+        edit_button.set_label(label, ctx);
+        edit_button.set_keybinding(Some(KeystrokeSource::Fixed(keystroke)), ctx);
         // Persist the mutated handle back into the per-action map so
         // subsequent renders see the updated label/keystroke.
         if let Some(entry) = self.orchestrate_card_handles.get_mut(action_id) {
-            entry.reject_button = Some(reject_button);
+            entry.edit_button = Some(edit_button);
         }
     }
 
@@ -6978,6 +6985,34 @@ impl AIBlock {
             None
         };
 
+        // Visual-only Host picker. Currently the worker host is fixed at
+        // "warp"; the picker is constructed as a real `Dropdown` so the
+        // four-column editor layout matches Figma 4340:117057. Selecting
+        // the lone item is a no-op (`OrchestrateAcceptMenuToggled` is the
+        // only available no-op action wired through `AIBlock`).
+        let needs_host = existing.is_none_or(|h| h.host_picker.is_none());
+        let host_picker = if needs_host {
+            let action_id_for_picker = action_id.clone();
+            Some(ctx.add_typed_action_view(move |ctx_dropdown| {
+                let mut dropdown = Dropdown::<AIBlockAction>::new(ctx_dropdown);
+                dropdown.set_main_axis_size(MainAxisSize::Min, ctx_dropdown);
+                dropdown.set_menu_header_text_override(|t| format!("Host: {t}"));
+                dropdown.set_style(DropdownStyle::ActionButtonSecondary, ctx_dropdown);
+                let item = MenuItemFields::new("Warp".to_string()).with_on_select_action(
+                    DropdownAction::SelectActionAndClose(
+                        AIBlockAction::OrchestrateAcceptMenuToggled {
+                            action_id: action_id_for_picker.clone(),
+                        },
+                    ),
+                );
+                dropdown.set_rich_items(vec![MenuItem::Item(item)], ctx_dropdown);
+                dropdown.set_selected_by_index(0, ctx_dropdown);
+                dropdown
+            }))
+        } else {
+            None
+        };
+
         let entry = self
             .orchestrate_card_handles
             .entry(action_id.clone())
@@ -6990,6 +7025,9 @@ impl AIBlock {
         }
         if entry.environment_picker.is_none() {
             entry.environment_picker = environment_picker;
+        }
+        if entry.host_picker.is_none() {
+            entry.host_picker = host_picker;
         }
     }
 

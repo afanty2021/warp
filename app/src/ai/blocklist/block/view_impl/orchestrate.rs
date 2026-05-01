@@ -10,25 +10,24 @@
 //!    cluster on the trailing edge.
 //!  - A body region (`theme.background()` fill) holding, in order: an
 //!    optional validation-error line (theme error color), the LLM-supplied
-//!    `summary` text followed inline by a `[⌘][E]` keyboard chip, an
-//!    `Agents (N)` label, and a horizontal row of static agent pills.
+//!    `summary` text, an `Agents (N)` label, and a horizontal row of
+//!    static agent pills.
 //!  - When the inline editor is open, an inset surface_1 panel is appended
-//!    below the body containing the Local/Cloud toggle and the
-//!    Model / Harness / Environment dropdown pickers.
+//!    below the body containing the Local/Cloud toggle and a four-column
+//!    row of dropdown pickers (Agent harness, Host, Environment, Base
+//!    model) per Figma node 4340:117057.
 //!
 //! Spec references: TECH.md §8, §9; PRODUCT.md "Confirmation card",
 //! "Post-action card states", "Invariants".
 
-use ai::agent::action::{OrchestrateExecutionMode, OrchestrateRequest};
+use ai::agent::action::OrchestrateRequest;
 use ai::agent::action_result::{OrchestrateAgentOutcomeKind, OrchestrateResult};
 use std::rc::Rc;
 use warpui::elements::{
-    Border, ChildView, Container, CornerRadius, CrossAxisAlignment, Empty, Flex, Hoverable,
-    MainAxisSize, MouseStateHandle, ParentElement, Radius, Text,
+    Border, ChildView, Container, CornerRadius, CrossAxisAlignment, Empty, Expanded, Flex,
+    Hoverable, MainAxisSize, MouseStateHandle, ParentElement, Radius, Text,
 };
-use warpui::keymap::Keystroke;
 use warpui::platform::Cursor;
-use warpui::ui_components::components::UiComponent;
 use warpui::{AppContext, Element, SingletonEntity};
 
 use crate::ai::agent::icons;
@@ -187,6 +186,9 @@ fn render_summary_with_edit_chip(
     state: &OrchestrateEditState,
     appearance: &Appearance,
 ) -> Box<dyn Element> {
+    // Per polish round 2 P2.3: the summary text is not editable, so the
+    // `\u2318E` keyboard chip that originally appeared next to it has been
+    // dropped. Render the LLM-supplied summary alone.
     let theme = appearance.theme();
     let summary = if state.summary.trim().is_empty() {
         format!(
@@ -205,25 +207,7 @@ fn render_summary_with_edit_chip(
     .with_selectable(true)
     .finish();
 
-    let row = Flex::row()
-        .with_cross_axis_alignment(CrossAxisAlignment::Center)
-        .with_main_axis_size(MainAxisSize::Min)
-        .with_spacing(8.)
-        .with_child(summary_text)
-        .with_child(render_edit_keyboard_chip(appearance))
-        .finish();
-
-    Container::new(row).with_margin_bottom(8.).finish()
-}
-
-fn render_edit_keyboard_chip(appearance: &Appearance) -> Box<dyn Element> {
-    let keystroke = Keystroke::parse("cmdorctrl-e")
-        .expect("orchestrate card edit keystroke literal must parse");
-    appearance
-        .ui_builder()
-        .keyboard_shortcut(&keystroke)
-        .build()
-        .finish()
+    Container::new(summary_text).with_margin_bottom(8.).finish()
 }
 
 fn render_agents_section(state: &OrchestrateEditState, app: &AppContext) -> Box<dyn Element> {
@@ -363,53 +347,15 @@ fn render_editor(
     handles: &OrchestrateCardHandles,
     appearance: &Appearance,
 ) -> Box<dyn Element> {
+    // Per Figma 4340:117057 the editor is a Local/Cloud segmented control
+    // followed by a single horizontal row of four equally-distributed
+    // dropdown columns: Agent harness, Host, Environment, Base model.
+    // Each column renders a small grey label above the dropdown body.
     let theme = appearance.theme();
     let mut column = Flex::column().with_cross_axis_alignment(CrossAxisAlignment::Stretch);
 
     column.add_child(render_mode_toggle(action_id, state, handles, appearance));
-    if let Some(model_picker) = &handles.model_picker {
-        column.add_child(render_picker_row(
-            "Model",
-            ChildView::new(model_picker).finish(),
-            appearance,
-        ));
-    }
-    if let Some(harness_picker) = &handles.harness_picker {
-        column.add_child(render_picker_row(
-            "Harness",
-            ChildView::new(harness_picker).finish(),
-            appearance,
-        ));
-    }
-    if let OrchestrateExecutionMode::Remote { worker_host, .. } = &state.execution_mode {
-        if let Some(env_picker) = &handles.environment_picker {
-            column.add_child(render_picker_row(
-                "Environment",
-                ChildView::new(env_picker).finish(),
-                appearance,
-            ));
-        }
-        column.add_child(
-            Container::new(
-                Text::new(
-                    format!(
-                        "Worker host: {} (TODO: editable picker)",
-                        if worker_host.is_empty() {
-                            "warp"
-                        } else {
-                            worker_host.as_str()
-                        }
-                    ),
-                    appearance.ui_font_family(),
-                    appearance.monospace_font_size(),
-                )
-                .with_color(blended_colors::text_disabled(theme, theme.surface_1()))
-                .finish(),
-            )
-            .with_margin_top(4.)
-            .finish(),
-        );
-    }
+    column.add_child(render_picker_row_quad(state, handles, appearance));
 
     Container::new(column.finish())
         .with_horizontal_padding(8.)
@@ -419,6 +365,102 @@ fn render_editor(
         .with_margin_bottom(12.)
         .with_background_color(theme.surface_1().into())
         .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+        .finish()
+}
+
+/// Renders the four-column dropdown row beneath the Local/Cloud toggle.
+/// Wraps each picker in `Expanded::new(1.0, ...)` so the columns share the
+/// available width equally; the parent `Flex::row` is set to
+/// `MainAxisSize::Max` to opt the children into flexible sizing.
+fn render_picker_row_quad(
+    _state: &OrchestrateEditState,
+    handles: &OrchestrateCardHandles,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    let mut row = Flex::row()
+        .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+        .with_main_axis_size(MainAxisSize::Max)
+        .with_spacing(12.);
+
+    row.add_child(
+        Expanded::new(
+            1.0,
+            render_picker_column(
+                "Agent harness",
+                handles
+                    .harness_picker
+                    .as_ref()
+                    .map(|p| ChildView::new(p).finish()),
+                appearance,
+            ),
+        )
+        .finish(),
+    );
+    row.add_child(
+        Expanded::new(
+            1.0,
+            render_picker_column(
+                "Host",
+                handles
+                    .host_picker
+                    .as_ref()
+                    .map(|p| ChildView::new(p).finish()),
+                appearance,
+            ),
+        )
+        .finish(),
+    );
+    row.add_child(
+        Expanded::new(
+            1.0,
+            render_picker_column(
+                "Environment",
+                handles
+                    .environment_picker
+                    .as_ref()
+                    .map(|p| ChildView::new(p).finish()),
+                appearance,
+            ),
+        )
+        .finish(),
+    );
+    row.add_child(
+        Expanded::new(
+            1.0,
+            render_picker_column(
+                "Base model",
+                handles
+                    .model_picker
+                    .as_ref()
+                    .map(|p| ChildView::new(p).finish()),
+                appearance,
+            ),
+        )
+        .finish(),
+    );
+
+    Container::new(row.finish()).with_margin_top(8.).finish()
+}
+
+fn render_picker_column(
+    label: &str,
+    picker: Option<Box<dyn Element>>,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    let theme = appearance.theme();
+    let label_el = Text::new(
+        label.to_string(),
+        appearance.ui_font_family(),
+        appearance.monospace_font_size() - 1.,
+    )
+    .with_color(blended_colors::text_disabled(theme, theme.surface_1()))
+    .finish();
+
+    let body: Box<dyn Element> = picker.unwrap_or_else(|| Empty::new().finish());
+    Flex::column()
+        .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+        .with_child(Container::new(label_el).with_margin_bottom(4.).finish())
+        .with_child(body)
         .finish()
 }
 
@@ -465,28 +507,6 @@ fn render_mode_toggle(
         .with_child(cloud_button)
         .finish();
     Container::new(row).with_margin_bottom(6.).finish()
-}
-
-fn render_picker_row(
-    label: &str,
-    picker: Box<dyn Element>,
-    appearance: &Appearance,
-) -> Box<dyn Element> {
-    let theme = appearance.theme();
-    let label_el = Text::new(
-        format!("{label}:"),
-        appearance.ui_font_family(),
-        appearance.monospace_font_size(),
-    )
-    .with_color(blended_colors::text_disabled(theme, theme.surface_1()))
-    .finish();
-    let row = Flex::row()
-        .with_cross_axis_alignment(CrossAxisAlignment::Center)
-        .with_main_axis_size(MainAxisSize::Min)
-        .with_child(Container::new(label_el).with_margin_right(8.).finish())
-        .with_child(picker)
-        .finish();
-    Container::new(row).with_margin_bottom(4.).finish()
 }
 
 fn render_segment_button(
