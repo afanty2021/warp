@@ -1196,12 +1196,19 @@ impl<A: Action + Clone> MenuItemFields<A> {
                 ret = ret.with_cursor(Cursor::PointingHand);
             }
             ret = ret.on_click(move |ctx, _, _| {
+                log::info!(
+                    "[orchestrate-debug] menu item on_click fired: depth={depth} row_index={row_index} item_index={item_index} has_action={} dispatch_item_actions={dispatch_item_actions}",
+                    on_select_action.is_some()
+                );
                 if let Some(action) = &on_select_action {
                     ctx.dispatch_typed_action(MenuAction::Select(SelectAction::Index {
                         row: row_index,
                         item: item_index,
                     }));
                     if dispatch_item_actions {
+                        log::info!(
+                            "[orchestrate-debug] menu item dispatching inner action via dispatch_typed_action"
+                        );
                         ctx.dispatch_typed_action(action.clone());
                     }
                     ctx.dispatch_typed_action(MenuAction::Close(true));
@@ -2642,8 +2649,13 @@ impl<A: Action + Clone> SubMenu<A> {
         // The footer (if any) was already placed inside the styled container above.
         // Wrap the full row in an EventHandler before passing to Dismiss.
         let dismiss_child = EventHandler::new(row.finish()).finish();
-        let mut dismiss = Dismiss::new(dismiss_child)
-            .on_dismiss(|ctx, _app| ctx.dispatch_typed_action(MenuAction::Close(false)));
+        let mut dismiss = Dismiss::new(dismiss_child).on_dismiss(|ctx, _app| {
+            // [orchestrate-debug] Diagnostic for P1.1 dropdown click
+            // routing: confirms whether outside-clicks reach the
+            // Dismiss underlay.
+            log::info!("[orchestrate-debug] Dismiss on_dismiss fired (treated as outside-click)");
+            ctx.dispatch_typed_action(MenuAction::Close(false))
+        });
 
         if prevent_interaction_with_other_elements {
             dismiss = dismiss.prevent_interaction_with_other_elements()
