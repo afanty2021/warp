@@ -6994,7 +6994,10 @@ impl AIBlock {
         // both types here once and reuse them across closures.
         let picker_border_color_warpui: warpui::elements::Fill =
             Fill::Solid(ColorU::new(0x29, 0x29, 0x29, 0xff)).into();
-        let picker_font_color = ColorU::new(0xe3, 0xe2, 0xdf, 0xff);
+        // [orchestrate-debug] Temporarily set to bright magenta to verify
+        // text-rendering. If still blank with this color, it's a layout
+        // issue, not a color issue.
+        let picker_font_color = ColorU::new(0xff, 0x00, 0xff, 0xff);
         let picker_background_theme: Fill = Appearance::as_ref(ctx).theme().surface_overlay_1();
         let picker_background_warpui: warpui::elements::Fill = picker_background_theme.into();
         let picker_styles = UiComponentStyles {
