@@ -3,8 +3,8 @@ use std::fmt::Debug;
 use pathfinder_color::ColorU;
 use warpui::{
     elements::{
-        Border, ChildAnchor, ChildView, ConstrainedBox, Container, Element, Icon,
-        MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, ParentElement,
+        Border, ChildAnchor, ChildView, ConstrainedBox, Container, CornerRadius, Element, Fill,
+        Icon, MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, ParentElement,
         PositionedElementAnchor, PositionedElementOffsetBounds, SavePosition, Stack,
     },
     fonts::FamilyId,
@@ -82,6 +82,18 @@ pub struct Dropdown<A: Action + Clone> {
     font_color: Option<ColorU>,
     font_size: Option<f32>,
     padding: Option<Coords>,
+    /// Optional override for the top-bar background fill, applied on top
+    /// of the variant's default style. Used by callers that need a
+    /// per-call appearance distinct from the shared `DropdownStyle`
+    /// variants (e.g. orchestrate confirmation card pickers per Figma
+    /// 4340:117057).
+    background: Option<Fill>,
+    /// Optional override for the top-bar border fill. See `background`.
+    border_color: Option<Fill>,
+    /// Optional override for the top-bar border width.
+    border_width: Option<f32>,
+    /// Optional override for the top-bar corner radius.
+    border_radius: Option<CornerRadius>,
     vertical_margin: f32,
     top_bar_height: f32,
 }
@@ -191,9 +203,33 @@ where
             font_color: None,
             font_size: None,
             padding: None,
+            background: None,
+            border_color: None,
+            border_width: None,
+            border_radius: None,
             vertical_margin: DROPDOWN_PADDING,
             top_bar_height: TOP_MENU_BAR_HEIGHT,
         }
+    }
+
+    pub fn set_background(&mut self, background: Fill, ctx: &mut ViewContext<Self>) {
+        self.background = Some(background);
+        ctx.notify();
+    }
+
+    pub fn set_border_color(&mut self, border_color: Fill, ctx: &mut ViewContext<Self>) {
+        self.border_color = Some(border_color);
+        ctx.notify();
+    }
+
+    pub fn set_border_width(&mut self, border_width: f32, ctx: &mut ViewContext<Self>) {
+        self.border_width = Some(border_width);
+        ctx.notify();
+    }
+
+    pub fn set_border_radius(&mut self, border_radius: CornerRadius, ctx: &mut ViewContext<Self>) {
+        self.border_radius = Some(border_radius);
+        ctx.notify();
     }
 
     pub fn with_drop_shadow(mut self) -> Self {
@@ -458,6 +494,10 @@ where
                 font_color: self.font_color,
                 font_size: self.font_size,
                 padding: self.padding,
+                background: self.background,
+                border_color: self.border_color,
+                border_width: self.border_width,
+                border_radius: self.border_radius,
                 ..Default::default()
             })
             .set_clicked_styles(None);

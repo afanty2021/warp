@@ -198,6 +198,8 @@ use crate::menu::{MenuItem, MenuItemFields};
 use crate::view_components::compactible_split_action_button::CompactibleSplitActionButton;
 use crate::view_components::dropdown::{Dropdown, DropdownAction, DropdownStyle};
 use crate::view_components::FilterableDropdown;
+use warpui::elements::{CornerRadius, Radius};
+use warpui::ui_components::components::Coords;
 
 use crate::editor::InteractionState;
 use crate::server::telemetry::{AutonomySettingToggleSource, InteractionSource};
@@ -256,6 +258,13 @@ const DEFAULT_USER_DISPLAY_NAME: &str = "User";
 const HAS_PENDING_ACTION: &str = "HasPendingAction";
 const DISPATCHED_REQUESTED_EDIT_KEYMAP_CONTEXT: &str = "PendingAIRequestedEdits";
 
+/// Keymap context flag set when at least one orchestrate confirmation
+/// card on this `AIBlock` has its inline editor open. Used to gate the
+/// `escape` keybinding for `OrchestrateDiscardEditsCurrentCard` so it
+/// only fires when an editor is actually open and doesn't shadow Esc
+/// elsewhere.
+pub(super) const ORCHESTRATE_EDITOR_OPEN: &str = "OrchestrateEditorOpen";
+
 const AUTO_EXPAND_REQUESTED_COMMAND_DELAY: std::time::Duration =
     std::time::Duration::from_millis(3000);
 
@@ -275,6 +284,31 @@ pub fn init(app: &mut AppContext) {
             "numpadenter",
             AIBlockAction::ExecuteNextPendingAction,
             id!(AIBlock::ui_name()) & id!(HAS_PENDING_ACTION),
+        ),
+        // Orchestrate confirmation-card keybindings (P1.2). Each
+        // resolves to the most-recent pending Orchestrate action via
+        // `current_orchestrate_action_id` at dispatch time; when no
+        // such card is pending the actions are no-ops, mirroring how
+        // `ExecuteNextPendingAction` behaves with no pending action.
+        // Reject (\u2303C) is intentionally NOT bound here \u2014 the universal
+        // ctrl-c cancel path already handles it.
+        FixedBinding::new(
+            "cmdorctrl-e",
+            AIBlockAction::OrchestrateToggleEditCurrentCard,
+            id!(AIBlock::ui_name()) & id!(HAS_PENDING_ACTION),
+        ),
+        FixedBinding::new(
+            "alt-enter",
+            AIBlockAction::OrchestrateAcceptCurrentCard,
+            id!(AIBlock::ui_name()) & id!(HAS_PENDING_ACTION),
+        ),
+        // Esc closes the orchestrate inline editor only when one is
+        // open, gated on `ORCHESTRATE_EDITOR_OPEN` so we don't shadow
+        // Esc elsewhere.
+        FixedBinding::new(
+            "escape",
+            AIBlockAction::OrchestrateDiscardEditsCurrentCard,
+            id!(AIBlock::ui_name()) & id!(ORCHESTRATE_EDITOR_OPEN),
         ),
     ]);
 
@@ -5943,6 +5977,27 @@ pub enum AIBlockAction {
     OrchestrateAcceptMenuToggled {
         action_id: AIAgentActionId,
     },
+
+    /// Keybinding-friendly variant: accept the most-recent pending
+    /// orchestrate card. Resolved at dispatch time via
+    /// [`AIBlock::current_orchestrate_action_id`]; no-op when there
+    /// isn't one. Bound to `\u2325\u21b5` (alt-enter) at app init.
+    OrchestrateAcceptCurrentCard,
+    /// Keybinding-friendly variant: reject the most-recent pending
+    /// orchestrate card. Currently unbound (the universal ctrl-c
+    /// cancel path covers reject) but exposed for symmetry with the
+    /// other Current-Card variants.
+    OrchestrateRejectCurrentCard,
+    /// Keybinding-friendly variant: toggle the inline editor on the
+    /// most-recent pending orchestrate card. Bound to `\u2318E` /
+    /// `Ctrl-E` at app init.
+    OrchestrateToggleEditCurrentCard,
+    /// Keybinding-friendly variant: close ("discard edits") the inline
+    /// editor on the most-recent pending orchestrate card whose editor
+    /// is open. Bound to `Esc` at app init, gated on the
+    /// `ORCHESTRATE_EDITOR_OPEN` keymap context so the binding only
+    /// fires when an editor is actually open.
+    OrchestrateDiscardEditsCurrentCard,
 }
 
 impl TypedActionView for AIBlock {
@@ -6643,12 +6698,73 @@ impl TypedActionView for AIBlock {
                 // structure already matches the Figma; the menu items
                 // (e.g. "Accept and \u2026") have not been speced yet.
             }
+            AIBlockAction::OrchestrateAcceptCurrentCard => {
+                if let Some(action_id) = self.current_orchestrate_action_id(ctx) {
+                    self.handle_orchestrate_accept(&action_id, ctx);
+                }
+            }
+            AIBlockAction::OrchestrateRejectCurrentCard => {
+                if let Some(action_id) = self.current_orchestrate_action_id(ctx) {
+                    self.cancel_action(&action_id, ctx);
+                }
+            }
+            AIBlockAction::OrchestrateToggleEditCurrentCard => {
+                if let Some(action_id) = self.current_orchestrate_action_id(ctx) {
+                    self.handle_orchestrate_toggle_edit(&action_id, ctx);
+                }
+            }
+            AIBlockAction::OrchestrateDiscardEditsCurrentCard => {
+                // Only act when the resolved card actually has its
+                // editor open. The keymap predicate already gates Esc
+                // on `ORCHESTRATE_EDITOR_OPEN`, but we re-check here
+                // because action dispatch can also come from non-keymap
+                // code paths.
+                if let Some(action_id) = self.current_orchestrate_card_with_editor_open() {
+                    self.handle_orchestrate_toggle_edit(&action_id, ctx);
+                }
+            }
         }
         ctx.notify();
     }
 }
 
 impl AIBlock {
+    /// Returns the action ID of the most-recent pending orchestrate
+    /// confirmation card on this block, or `None` if no such card
+    /// exists. "Most-recent" is the last entry in the conversation's
+    /// pending-action queue; multi-card disambiguation \u2014 last in wins.
+    /// Used by the keymap-friendly `Orchestrate*CurrentCard` action
+    /// variants to resolve a target at dispatch time.
+    fn current_orchestrate_action_id(&self, app: &AppContext) -> Option<AIAgentActionId> {
+        self.action_model
+            .as_ref(app)
+            .get_pending_actions_for_conversation(&self.client_ids.conversation_id)
+            .filter(|action| matches!(action.action, AIAgentActionType::Orchestrate(_)))
+            .last()
+            .map(|action| action.id.clone())
+    }
+
+    /// Returns the action ID of the most-recent pending orchestrate
+    /// card whose inline editor is currently open, or `None`. Used to
+    /// scope `OrchestrateDiscardEditsCurrentCard` to cards that
+    /// actually have an editor to close.
+    fn current_orchestrate_card_with_editor_open(&self) -> Option<AIAgentActionId> {
+        self.orchestrate_edit_states
+            .iter()
+            .find(|(_, state)| state.is_editor_open)
+            .map(|(id, _)| id.clone())
+    }
+
+    /// Returns true when at least one orchestrate confirmation card on
+    /// this block has its inline editor open. Read by
+    /// `keymap_context` to set the `ORCHESTRATE_EDITOR_OPEN` flag that
+    /// gates the `escape` keybinding.
+    pub(super) fn has_orchestrate_editor_open(&self) -> bool {
+        self.orchestrate_edit_states
+            .values()
+            .any(|state| state.is_editor_open)
+    }
+
     /// Lazily build the Reject / Edit / Accept button views for an
     /// orchestrate confirmation card. Called when an Orchestrate action
     /// is observed in the streaming output so the card can render the
@@ -6837,6 +6953,50 @@ impl AIBlock {
         action_id: &AIAgentActionId,
         ctx: &mut ViewContext<Self>,
     ) {
+        // Figma orchestrate inline-editor picker styling helpers (node
+        // 4340:117057). Per the design, each dropdown shares the same
+        // 36px-tall pill-styled top bar regardless of which dropdown
+        // type backs it; centralising the values here avoids drift
+        // between Dropdown<AIBlockAction> and FilterableDropdown<...>.
+        // Background uses `fg_overlay_1` (5% foreground over
+        // background) which matches the `rgba(250,249,246,0.05)` token
+        // in the dark mock; border + text colors are dark-mode-tuned
+        // hex literals from the same Figma node \u2014 they don't map to
+        // existing theme tokens and a future theming pass should
+        // promote them.
+        const ORCHESTRATE_PICKER_HEIGHT: f32 = 36.;
+        const ORCHESTRATE_PICKER_RADIUS: f32 = 4.;
+        const ORCHESTRATE_PICKER_BORDER_WIDTH: f32 = 1.;
+        const ORCHESTRATE_PICKER_FONT_SIZE: f32 = 14.;
+        let picker_padding = Coords {
+            top: 10.,
+            bottom: 10.,
+            left: 12.,
+            right: 12.,
+        };
+        let picker_corner_radius =
+            CornerRadius::with_all(Radius::Pixels(ORCHESTRATE_PICKER_RADIUS));
+        // `set_background` / `set_border_color` on `Dropdown` and the
+        // `background` / `border_color` fields on `UiComponentStyles`
+        // both expect `warpui::elements::Fill`, while `theme.*()` accessors
+        // return the parallel `warp_core::ui::theme::Fill`. We materialize
+        // both types here once and reuse them across closures.
+        let picker_border_color_warpui: warpui::elements::Fill =
+            Fill::Solid(ColorU::new(0x29, 0x29, 0x29, 0xff)).into();
+        let picker_font_color = ColorU::new(0xe3, 0xe2, 0xdf, 0xff);
+        let picker_background_theme: Fill = Appearance::as_ref(ctx).theme().surface_overlay_1();
+        let picker_background_warpui: warpui::elements::Fill = picker_background_theme.into();
+        let picker_styles = UiComponentStyles {
+            height: Some(ORCHESTRATE_PICKER_HEIGHT),
+            background: Some(picker_background_warpui),
+            border_color: Some(picker_border_color_warpui),
+            border_width: Some(ORCHESTRATE_PICKER_BORDER_WIDTH),
+            border_radius: Some(picker_corner_radius),
+            font_size: Some(ORCHESTRATE_PICKER_FONT_SIZE),
+            font_color: Some(picker_font_color),
+            padding: Some(picker_padding),
+            ..Default::default()
+        };
         let Some(state) = self.orchestrate_edit_states.get(action_id).cloned() else {
             return;
         };
@@ -6849,11 +7009,23 @@ impl AIBlock {
         let model_picker = if needs_model {
             let action_id_for_picker = action_id.clone();
             let initial_model_id = state.model_id.clone();
+            let picker_padding_clone = picker_padding;
+            let picker_corner_radius_clone = picker_corner_radius;
+            let picker_background_clone = picker_background_warpui;
+            let picker_border_color_clone = picker_border_color_warpui;
             Some(ctx.add_typed_action_view(move |ctx_dropdown| {
                 let mut dropdown = Dropdown::<AIBlockAction>::new(ctx_dropdown);
-                dropdown.set_main_axis_size(MainAxisSize::Min, ctx_dropdown);
+                dropdown.set_main_axis_size(MainAxisSize::Max, ctx_dropdown);
                 dropdown.set_menu_header_text_override(|t| format!("Model: {t}"));
                 dropdown.set_style(DropdownStyle::ActionButtonSecondary, ctx_dropdown);
+                dropdown.set_top_bar_height(ORCHESTRATE_PICKER_HEIGHT, ctx_dropdown);
+                dropdown.set_padding(picker_padding_clone, ctx_dropdown);
+                dropdown.set_border_radius(picker_corner_radius_clone, ctx_dropdown);
+                dropdown.set_background(picker_background_clone, ctx_dropdown);
+                dropdown.set_border_color(picker_border_color_clone, ctx_dropdown);
+                dropdown.set_border_width(ORCHESTRATE_PICKER_BORDER_WIDTH, ctx_dropdown);
+                dropdown.set_font_size(ORCHESTRATE_PICKER_FONT_SIZE, ctx_dropdown);
+                dropdown.set_font_color(picker_font_color, ctx_dropdown);
 
                 let llm_prefs = LLMPreferences::as_ref(ctx_dropdown);
                 let choices: Vec<_> = llm_prefs.get_base_llm_choices_for_agent_mode().collect();
@@ -6890,11 +7062,23 @@ impl AIBlock {
         let harness_picker = if needs_harness {
             let action_id_for_picker = action_id.clone();
             let initial_harness = state.harness_type.clone();
+            let picker_padding_clone = picker_padding;
+            let picker_corner_radius_clone = picker_corner_radius;
+            let picker_background_clone = picker_background_warpui;
+            let picker_border_color_clone = picker_border_color_warpui;
             Some(ctx.add_typed_action_view(move |ctx_dropdown| {
                 let mut dropdown = Dropdown::<AIBlockAction>::new(ctx_dropdown);
-                dropdown.set_main_axis_size(MainAxisSize::Min, ctx_dropdown);
+                dropdown.set_main_axis_size(MainAxisSize::Max, ctx_dropdown);
                 dropdown.set_menu_header_text_override(|t| format!("Harness: {t}"));
                 dropdown.set_style(DropdownStyle::ActionButtonSecondary, ctx_dropdown);
+                dropdown.set_top_bar_height(ORCHESTRATE_PICKER_HEIGHT, ctx_dropdown);
+                dropdown.set_padding(picker_padding_clone, ctx_dropdown);
+                dropdown.set_border_radius(picker_corner_radius_clone, ctx_dropdown);
+                dropdown.set_background(picker_background_clone, ctx_dropdown);
+                dropdown.set_border_color(picker_border_color_clone, ctx_dropdown);
+                dropdown.set_border_width(ORCHESTRATE_PICKER_BORDER_WIDTH, ctx_dropdown);
+                dropdown.set_font_size(ORCHESTRATE_PICKER_FONT_SIZE, ctx_dropdown);
+                dropdown.set_font_color(picker_font_color, ctx_dropdown);
 
                 let mut items: Vec<MenuItem<DropdownAction<AIBlockAction>>> = Vec::new();
                 let mut selected_idx = None;
@@ -6936,10 +7120,12 @@ impl AIBlock {
                 OrchestrateExecutionMode::Remote { environment_id, .. } => environment_id.clone(),
                 OrchestrateExecutionMode::Local => String::new(),
             };
+            let picker_styles_clone = picker_styles;
             Some(ctx.add_typed_action_view(move |ctx_dropdown| {
                 let mut dropdown = FilterableDropdown::<AIBlockAction>::new(ctx_dropdown);
-                dropdown.set_main_axis_size(MainAxisSize::Min, ctx_dropdown);
+                dropdown.set_main_axis_size(MainAxisSize::Max, ctx_dropdown);
                 dropdown.set_button_variant(ButtonVariant::Secondary);
+                dropdown.set_style(picker_styles_clone);
                 dropdown.set_menu_header_text_override(|t| format!("Environment: {t}"));
                 dropdown.set_menu_width(280.0, ctx_dropdown);
 
@@ -6993,11 +7179,23 @@ impl AIBlock {
         let needs_host = existing.is_none_or(|h| h.host_picker.is_none());
         let host_picker = if needs_host {
             let action_id_for_picker = action_id.clone();
+            let picker_padding_clone = picker_padding;
+            let picker_corner_radius_clone = picker_corner_radius;
+            let picker_background_clone = picker_background_warpui;
+            let picker_border_color_clone = picker_border_color_warpui;
             Some(ctx.add_typed_action_view(move |ctx_dropdown| {
                 let mut dropdown = Dropdown::<AIBlockAction>::new(ctx_dropdown);
-                dropdown.set_main_axis_size(MainAxisSize::Min, ctx_dropdown);
+                dropdown.set_main_axis_size(MainAxisSize::Max, ctx_dropdown);
                 dropdown.set_menu_header_text_override(|t| format!("Host: {t}"));
                 dropdown.set_style(DropdownStyle::ActionButtonSecondary, ctx_dropdown);
+                dropdown.set_top_bar_height(ORCHESTRATE_PICKER_HEIGHT, ctx_dropdown);
+                dropdown.set_padding(picker_padding_clone, ctx_dropdown);
+                dropdown.set_border_radius(picker_corner_radius_clone, ctx_dropdown);
+                dropdown.set_background(picker_background_clone, ctx_dropdown);
+                dropdown.set_border_color(picker_border_color_clone, ctx_dropdown);
+                dropdown.set_border_width(ORCHESTRATE_PICKER_BORDER_WIDTH, ctx_dropdown);
+                dropdown.set_font_size(ORCHESTRATE_PICKER_FONT_SIZE, ctx_dropdown);
+                dropdown.set_font_color(picker_font_color, ctx_dropdown);
                 let item = MenuItemFields::new("Warp".to_string()).with_on_select_action(
                     DropdownAction::SelectActionAndClose(
                         AIBlockAction::OrchestrateAcceptMenuToggled {

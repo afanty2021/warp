@@ -64,7 +64,7 @@ use crate::util::truncation::truncate_from_end;
 use super::secret_redaction::SecretRedactionState;
 use super::{
     attachment_names, AIBlock, AIBlockAction, DISPATCHED_REQUESTED_EDIT_KEYMAP_CONTEXT,
-    HAS_PENDING_ACTION, RICH_CONTENT_SECRET_FIRST_CHAR_POSITION_ID,
+    HAS_PENDING_ACTION, ORCHESTRATE_EDITOR_OPEN, RICH_CONTENT_SECRET_FIRST_CHAR_POSITION_ID,
 };
 
 use super::TextLocation;
@@ -1248,6 +1248,13 @@ impl View for AIBlock {
 
         if self.has_pending_requested_edit(app) {
             context.set.insert(DISPATCHED_REQUESTED_EDIT_KEYMAP_CONTEXT);
+        }
+
+        // Gate the orchestrate-card Esc keybinding so it only fires
+        // when at least one orchestrate confirmation card on this block
+        // has its inline editor open.
+        if self.has_orchestrate_editor_open() {
+            context.set.insert(ORCHESTRATE_EDITOR_OPEN);
         }
 
         context
